@@ -1,0 +1,95 @@
+use meshopt;
+use collections;
+use fs;
+use io;
+
+// Checks spatial_sort_remap and spatial_cluster_points against meshoptimizer
+// (tests/reference/spatial.cpp -> tests/spatial_expected.txt). Returns the number of failures.
+
+fn read_all<a>(path: &a [u8]) -> u8[] {
+    match fs::read(path) {
+        d: u8[] => { return d; },
+        e: io::Error => { println("cannot read tests/spatial_expected.txt"); return u8[]; }
+    }
+}
+fn number<a>(text: &a [u8]) -> u64 {
+    mut v: u64 = 0;
+    mut neg = false;
+    for i in text.len() {
+        if text[i] == 45 {
+            neg = true;
+        } else {
+            v = v * 10 + (text[i] - 48);
+        }
+    }
+    return v;
+}
+fn signed<a>(text: &a [u8]) -> i64 {
+    if text[0] == 45 {
+        return 0 - i64(number(&text[1: text.len()]));
+    }
+    return i64(number(&text));
+}
+fn same<a, b>(x: &a [u8], y: &b [u8]) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    for i in x.len() {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+fn main() -> u64 {
+    text := read_all("tests/spatial_expected.txt");
+    mut failures: u64 = 0;
+    mut checks: u64 = 0;
+    mut pos = f32[];
+    mut count: u64 = 0;
+    mut start: u64 = 0;
+    for i in text.len() {
+        if text[i] != 10 {
+            continue;
+        }
+        mut f = u8[][];
+        mut s = start;
+        while s < i {
+            mut e = s;
+            while (e < i) && (text[e] != 32) {
+                e += 1;
+            }
+            f.push(text[s: e].copy());
+            s = e + 1;
+        }
+        start = i + 1;
+        tag := f[0].copy();
+        if same(&tag, "pos") {
+            count = number(&f[1]);
+            pos = f32[];
+            for k in count * 4 {
+                pos.push(f32_from_bits(number(&f[k + 2])));
+            }
+            continue;
+        }
+        checks += 1;
+        mut got = u64[];
+        if same(&tag, "sort") {
+            got = meshopt::spatial_sort_remap(&pos, count, 4);
+        } else {
+            got = meshopt::spatial_cluster_points(&pos, count, 4, number(&f[1]));
+        }
+        mut ok = got.len() == count;
+        for k in count {
+            if ok && (got[k] != number(&f[k + 2])) {
+                ok = false;
+            }
+        }
+        if ok == false {
+            println("FAIL {} {} (n={})", tag.text(), number(&f[1]), count);
+            failures += 1;
+        }
+    }
+    println("{} checks, {} failures", checks, failures);
+    return failures;
+}

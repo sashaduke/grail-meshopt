@@ -1401,3 +1401,200 @@ pub fn partition_clusters<a, b, c>(indices: (&a u64[]), counts: (&a u64[]), posi
     out.push(next_group);
     return out;
 }
+
+// ---- spatial order: meshopt_spatialSortRemap / meshopt_spatialClusterPoints ----
+
+fn part1by2(v: u64) -> u64 {
+    mut x = v & 1048575;
+    x = (x ^ (x << 32)) & 4222124650725375;
+    x = (x ^ (x << 16)) & 4222128928850175;
+    x = (x ^ (x << 8)) & 4223155694530575;
+    x = (x ^ (x << 4)) & 54901024028897475;
+    x = (x ^ (x << 2)) & 164703072086692425;
+    return x;
+}
+
+// computeOrder: per point, morton code or (x | y<<20 | z<<40) of 16-bit quantised coordinates.
+fn compute_order<a>(p: (&a f32[]), n: u64, stride: u64, morton: bool) -> u64[] {
+    big := flt_max();
+    mut minv = f32[big, big, big];
+    mut maxv = f32[0.0 - big, 0.0 - big, 0.0 - big];
+    for i in n {
+        for j in 3 {
+            v := p[i * stride + j];
+            if minv[j] > v {
+                minv[j] = v;
+            }
+            if maxv[j] < v {
+                maxv[j] = v;
+            }
+        }
+    }
+    mut extent: f32 = 0.0;
+    for j in 3 {
+        d := maxv[j] - minv[j];
+        if (d < extent) == false {
+            extent = d;
+        }
+    }
+    mut scale: f32 = 0.0;
+    if extent != 0.0 {
+        q: f32 := 65535.0;
+        scale = q / extent;
+    }
+    half: f32 := 0.5;
+    mut out = u64[];
+    for i in n {
+        mut c = u64[];
+        for j in 3 {
+            c.push(u64(i64((p[i * stride + j] - minv[j]) * scale + half)));
+        }
+        if morton {
+            out.push(part1by2(c[0]) | (part1by2(c[1]) << 1) | (part1by2(c[2]) << 2));
+        } else {
+            out.push(c[0] | (c[1] << 20) | (c[2] << 40));
+        }
+    }
+    return out;
+}
+
+// Stable counting sort of `source` by keys[source[i]] (keys < buckets).
+fn counting_pass<a, b>(source: (&a u64[]), keys: (&b u64[]), buckets: u64) -> u64[] {
+    mut hist = u64[];
+    for i in buckets + 1 {
+        hist.push(0);
+    }
+    for i in source.len() {
+        hist[keys[source[i]] + 1] = hist[keys[source[i]] + 1] + 1;
+    }
+    for i in buckets {
+        hist[i + 1] = hist[i + 1] + hist[i];
+    }
+    mut out = u64[];
+    for i in source.len() {
+        out.push(0);
+    }
+    for i in source.len() {
+        k := keys[source[i]];
+        out[hist[k]] = source[i];
+        hist[k] = hist[k] + 1;
+    }
+    return out;
+}
+
+// remap[i] = position of point i in morton order.
+pub fn spatial_sort_remap<a>(positions: (&a f32[]), n: u64, stride: u64) -> u64[] {
+    keys := compute_order(&positions, n, stride, true);
+    mut order = u64[];
+    for i in n {
+        order.push(i);
+    }
+    for k in 5 {
+        mut kk = u64[];
+        for i in n {
+            kk.push((keys[i] >> (k * 10)) & 1023);
+        }
+        order = counting_pass(&order, &kk, 1024);
+    }
+    mut out = u64[];
+    for i in n {
+        out.push(0);
+    }
+    for i in n {
+        out[order[i]] = i;
+    }
+    return out;
+}
+
+// axes holds the three sorted orders back to back (n entries each); limits = [n, cluster].
+fn split_points<a, b, c>(dest: (&a mut u64[]), axes: (&b mut u64[]), keys: (&c u64[]), base: u64, count: u64, limits: (&c u64[])) -> unit {
+    n := limits[0];
+    cluster := limits[1];
+    if count <= cluster {
+        for i in count {
+            dest.push(axes[base + i]);
+        }
+        return ();
+    }
+    mut bestk: u64 = 0;
+    mut bestdim: u64 = 0;
+    for k in 3 {
+        mask: u64 := 1048575;
+        hi := (keys[axes[k * n + base + count - 1]] >> (k * 20)) & mask;
+        lo := (keys[axes[k * n + base]] >> (k * 20)) & mask;
+        dim := wrapping_sub(hi, lo) & 4294967295;
+        if dim >= bestdim {
+            bestk = k;
+            bestdim = dim;
+        }
+    }
+    split := ((count / 2) + cluster - 1) / cluster * cluster;
+    mut side = [u64: u64]();
+    for i in count {
+        mut s: u64 = 1;
+        if i < split {
+            s = 0;
+        }
+        side.insert(axes[bestk * n + base + i], s);
+    }
+    for k in 3 {
+        if k == bestk {
+            continue;
+        }
+        mut left = u64[];
+        mut right = u64[];
+        for i in count {
+            p := axes[k * n + base + i];
+            mut s: u64 = 0;
+            match side.get(&p) {
+                Some(v) => { s = load(v); },
+                None => { }
+            }
+            if s == 0 {
+                left.push(p);
+            } else {
+                right.push(p);
+            }
+        }
+        for i in left.len() {
+            axes[k * n + base + i] = left[i];
+        }
+        for i in right.len() {
+            axes[k * n + base + split + i] = right[i];
+        }
+    }
+    split_points(&mut dest, &mut axes, &keys, base, split, &limits);
+    split_points(&mut dest, &mut axes, &keys, base + split, count - split, &limits);
+    return ();
+}
+
+// Point order whose consecutive runs of `cluster` points are spatially compact.
+pub fn spatial_cluster_points<a>(positions: (&a f32[]), n: u64, stride: u64, cluster: u64) -> u64[] {
+    keys := compute_order(&positions, n, stride, false);
+    mut axes = u64[];
+    for k in 3 {
+        mut kk = u64[];
+        for i in n {
+            kk.push((keys[i] >> (k * 20)) & 65535);
+        }
+        mut order = u64[];
+        for i in n {
+            order.push(i);
+        }
+        mut lo = u64[];
+        mut hi = u64[];
+        for i in n {
+            lo.push(kk[i] & 255);
+            hi.push(kk[i] >> 8);
+        }
+        order = counting_pass(&order, &lo, 256);
+        order = counting_pass(&order, &hi, 256);
+        for i in n {
+            axes.push(order[i]);
+        }
+    }
+    mut dest = u64[];
+    limits := u64[n, cluster];
+    split_points(&mut dest, &mut axes, &keys, 0, n, &limits);
+    return dest;
+}

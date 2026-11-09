@@ -15,10 +15,11 @@ Ported so far:
   SNORM form)
 - `build_meshlets_spatial` and `build_meshlets_bound` (meshopt_buildMeshletsSpatial: SAH-split
   BVH clusters, as Abundance's cluster builder uses them)
+- `spatial_sort_remap`, `spatial_cluster_points` (meshopt_spatialSortRemap / spatialClusterPoints)
 - `partition_clusters` (meshopt_partitionClusters, with or without positions; the partition count
   is appended as the last element)
 
-In progress: spatial sort and clustering, meshlet optimisation and the simplifier, which together
+In progress: meshlet optimisation and the simplifier, which together
 with the above back Abundance's cluster LOD builder.
 
 ## Use
