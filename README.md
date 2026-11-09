@@ -33,7 +33,19 @@ Ported so far:
 
 - `simplify_sloppy`, `simplify_scale` (meshopt_simplifySloppy / meshopt_simplifyScale)
 
-Together these cover every meshoptimizer call in Abundance's cluster LOD builder (clusterlod.h)., which together
+Together these cover every meshoptimizer call in Abundance's cluster LOD builder.
+
+## clod: cluster LOD hierarchies
+
+`src/clusterlod.grl` ports meshoptimizer's `demo/clusterlod.h` as module `clod`:
+`default_config`, `default_config_rt`, `build` (group/simplify/re-cluster DAG with sparse
+attribute-aware simplification, permissive and sloppy fallbacks, boundary locking, UV-seam
+protection, border dilation and the edge-length error limit), `local_indices`,
+`build_hierarchy_bound` and `build_hierarchy`. `clodBuild`'s output callback becomes data: `build`
+returns the groups and clusters in callback order, so a group's id is its index and
+`Cluster.refined` names the group it came from. Only the spatial clusterizer is ported (`build`
+returns None when `cluster_spatial` is false); Abundance uses it. `tests/clusterlod.grl` compares
+78 groups, 531 clusters, the dilated positions and 108 hierarchy nodes bit for bit., which together
 with the above back Abundance's cluster LOD builder.
 
 ## Use

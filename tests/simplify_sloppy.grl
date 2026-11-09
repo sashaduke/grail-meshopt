@@ -1,3 +1,7 @@
+// Checks simplify_sloppy (meshopt_simplifySloppy) and simplify_scale (meshopt_simplifyScale): every
+// output index and the error and scale bits against meshoptimizer
+// (tests/reference/simplify_sloppy.cpp -> tests/simplify_sloppy_expected.txt). Returns the number of
+// failures.
 use meshopt;
 use collections;
 use fs;

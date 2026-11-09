@@ -1,0 +1,770 @@
+// clusterlod: cluster LOD hierarchies on top of meshopt, ported from meshoptimizer's
+// demo/clusterlod.h (Arseny Kapoulkine, MIT; see NOTICE) for Abundance's geometry builder.
+//
+// clodBuild reports each group through a callback; here `build` returns the groups and their
+// clusters in the order the callback would see them, so a group's id is its index in
+// `Lod.groups` and `Cluster.refined` is the id of the group it was simplified from (-1 for
+// original geometry). With border dilation the positions move after earlier groups were output,
+// so each cluster then carries a snapshot of its corner positions as the callback saw them.
+module clod;
+
+use meshopt;
+
+pub struct Config {
+    // Cluster shape (meshopt::build_meshlets_spatial).
+    max_vertices: u64,
+    min_triangles: u64,
+    max_triangles: u64,
+    // Grouping (meshopt::partition_clusters, optionally sorted spatially).
+    partition_spatial: bool,
+    partition_sort: bool,
+    partition_size: u64,
+    // Clusterization: only the spatial (SAH) builder is ported; build returns None otherwise.
+    cluster_spatial: bool,
+    cluster_fill_weight: f32,
+    cluster_split_factor: f32,
+    // Each level aims to keep simplify_ratio of the triangles; groups above simplify_threshold
+    // are stuck and become terminal.
+    simplify_ratio: f32,
+    simplify_threshold: f32,
+    // error = max(previous * merge_previous, current) + current * merge_additive
+    simplify_error_merge_previous: f32,
+    simplify_error_merge_additive: f32,
+    simplify_error_factor_sloppy: f32,
+    simplify_error_edge_limit: f32,
+    simplify_error_clamped: bool,
+    simplify_permissive: bool,
+    simplify_fallback_permissive: bool,
+    simplify_fallback_sloppy: bool,
+    simplify_regularize: bool,
+    simplify_preserve_folds: bool,
+    // Moves open-border vertices outward to offset area lost by simplification (mutates positions).
+    simplify_dilate_borders: bool,
+    optimize_bounds: bool,
+    optimize_clusters: bool,
+    optimize_clusters_level: u64
+}
+
+// Input mesh: positions (3 floats per vertex, `stride` floats apart), attributes (`attribute_stride`
+// floats per vertex, the first weights.len() weighted), optional per-vertex lock flags and a mask of
+// attributes whose discontinuities protect vertices in permissive mode.
+pub struct Mesh {
+    indices: u64[],
+    vertex_count: u64,
+    positions: f32[],
+    stride: u64,
+    attributes: f32[],
+    attribute_stride: u64,
+    lock: u8[],
+    weights: f32[],
+    protect_mask: u64
+}
+
+// A sphere and the simplification error it carries, in mesh space.
+pub struct Bounds {
+    center: f32[],
+    radius: f32,
+    error: f32
+}
+
+pub struct Cluster {
+    refined: i64,
+    bounds: Bounds,
+    indices: u64[],
+    vertex_count: u64,
+    // Corner positions (3 per index) when the build dilates borders; empty otherwise.
+    positions: f32[]
+}
+
+// clodGroup, plus the range of its clusters in Lod.clusters.
+pub struct Group {
+    depth: u64,
+    simplified: Bounds,
+    first: u64,
+    count: u64
+}
+
+pub struct Lod {
+    groups: Group[],
+    clusters: Cluster[]
+}
+
+// clodNode: a BVH node over groups; leaves name a group, internal nodes a child range.
+pub struct Node {
+    bounds: Bounds,
+    group: i64,
+    child_offset: u64,
+    child_count: u64
+}
+
+// clodDefaultConfig
+pub fn default_config(max_triangles: u64) -> Config {
+    return Config {
+        max_vertices: max_triangles,
+        min_triangles: max_triangles / 3,
+        max_triangles: max_triangles,
+        partition_spatial: true,
+        partition_sort: false,
+        partition_size: 16,
+        cluster_spatial: false,
+        cluster_fill_weight: 0.0,
+        cluster_split_factor: 2.0,
+        simplify_ratio: 0.5,
+        simplify_threshold: 0.85,
+        simplify_error_merge_previous: 1.0,
+        simplify_error_merge_additive: 0.0,
+        simplify_error_factor_sloppy: 2.0,
+        simplify_error_edge_limit: 0.0,
+        simplify_error_clamped: true,
+        simplify_permissive: true,
+        simplify_fallback_permissive: false,
+        simplify_fallback_sloppy: true,
+        simplify_regularize: false,
+        simplify_preserve_folds: false,
+        simplify_dilate_borders: false,
+        optimize_bounds: false,
+        optimize_clusters: true,
+        optimize_clusters_level: 1
+    };
+}
+
+// clodDefaultConfigRT
+pub fn default_config_rt(max_triangles: u64) -> Config {
+    mut config = default_config(max_triangles);
+    config.min_triangles = max_triangles / 4;
+    config.max_vertices = max_triangles * 2;
+    if 256 < config.max_vertices {
+        config.max_vertices = 256;
+    }
+    config.cluster_spatial = true;
+    config.cluster_fill_weight = 0.5;
+    return config;
+}
+
+fn flt_max() -> f32 {
+    return f32_from_bits(2139095039);
+}
+
+// std::max / std::min on floats (the first argument wins ties and NaNs).
+fn fmax(a: f32, b: f32) -> f32 {
+    if a < b {
+        return b;
+    }
+    return a;
+}
+
+fn fmin(a: f32, b: f32) -> f32 {
+    if b < a {
+        return b;
+    }
+    return a;
+}
+
+fn count_f(n: u64) -> f32 {
+    return f32(i64(n));
+}
+
+// v[a..b] as a new vector (Grail slices only byte vectors so far).
+fn span<a>(v: (&a u64[]), a: u64, b: u64) -> u64[] {
+    mut out = u64[];
+    for i in b - a {
+        out.push(v[a + i]);
+    }
+    return out;
+}
+
+fn copy_bounds<a>(b: (&a Bounds)) -> Bounds {
+    return Bounds { center: b.center.copy(), radius: b.radius, error: b.error };
+}
+
+// A cluster during the build: its indices live in a shared vector.
+struct Work {
+    vertices: u64,
+    index_offset: u64,
+    index_count: u64,
+    refined: i64,
+    bounds: Bounds
+}
+
+fn copy_work<a>(w: (&a Work)) -> Work {
+    return Work { vertices: w.vertices, index_offset: w.index_offset, index_count: w.index_count, refined: w.refined, bounds: copy_bounds(&w.bounds) };
+}
+
+// boundsCompute
+fn bounds_compute<a, b>(mesh: (&a Mesh), indices: (&b u64[]), error: f32) -> Bounds {
+    m := meshopt::compute_cluster_bounds(&indices, &mesh.positions, mesh.stride);
+    return Bounds { center: m.center.copy(), radius: m.radius, error: error };
+}
+
+// boundsMerge: a sphere around the spheres; the error is the largest one.
+fn bounds_merge<a>(spheres: (&a Bounds[])) -> Bounds {
+    mut centers = f32[];
+    mut radii = f32[];
+    for i in spheres.len() {
+        for k in 3 {
+            centers.push(spheres[i].center[k]);
+        }
+        radii.push(spheres[i].radius);
+    }
+    merged := meshopt::compute_sphere_bounds(&centers, spheres.len(), 3, &radii, 1);
+    mut error: f32 = 0.0;
+    for i in spheres.len() {
+        error = fmax(error, spheres[i].error);
+    }
+    return Bounds { center: merged.center.copy(), radius: merged.radius, error: error };
+}
+
+// clusterize: spatial meshlets of `indices`, optionally optimised, appended as Work entries with
+// their global indices.
+fn clusterize<a, b, c>(clusters: (&a mut Work[]), cluster_indices: (&a mut u64[]), config: (&b Config), mesh: (&b Mesh), indices: (&c u64[]), refined: i64) {
+    m := meshopt::build_meshlets_spatial(&indices, &mesh.positions, mesh.vertex_count, mesh.stride, config.max_vertices, config.min_triangles, config.max_triangles, config.cluster_fill_weight);
+    for i in m.meshlets.len() {
+        ml := &m.meshlets[i];
+        mut verts = span(&m.vertices, ml.vertex_offset, ml.vertex_offset + ml.vertex_count);
+        mut tris = m.triangles[ml.triangle_offset: ml.triangle_offset + ml.triangle_count * 3].copy();
+        if config.optimize_clusters {
+            o := meshopt::optimize_meshlet_level(&verts, &tris, config.optimize_clusters_level);
+            verts = o.vertices.copy();
+            tris = o.triangles.copy();
+        }
+        offset := cluster_indices.len();
+        for j in tris.len() {
+            cluster_indices.push(verts[tris[j]]);
+        }
+        clusters.push(Work { vertices: ml.vertex_count, index_offset: offset, index_count: tris.len(), refined: refined, bounds: Bounds { center: f32[0.0, 0.0, 0.0], radius: 0.0, error: 0.0 } });
+    }
+}
+
+// partition: groups the clusters (reordering them so each group is contiguous) and returns the
+// group offsets.
+fn partition<a, b>(clusters: (&a mut Work[]), config: (&b Config), mesh: (&b Mesh), indices: (&a u64[]), remap: (&b u64[])) -> u64[] {
+    n := clusters.len();
+    if n <= config.partition_size {
+        return u64[0, n];
+    }
+    mut counts = u64[];
+    mut flat = u64[];
+    for i in n {
+        counts.push(clusters[i].index_count);
+        for j in clusters[i].index_count {
+            flat.push(remap[indices[clusters[i].index_offset + j]]);
+        }
+    }
+    mut positions = f32[];
+    if config.partition_spatial {
+        positions = mesh.positions.copy();
+    }
+    mut part = meshopt::partition_clusters(&flat, &counts, &positions, remap.len(), mesh.stride, config.partition_size);
+    mut count: u64 = 0;
+    for i in n {
+        if count < part[i] + 1 {
+            count = part[i] + 1;
+        }
+    }
+    if config.partition_sort {
+        // Any representative point will do; the last cluster's center, as in clusterlod.h.
+        mut points = f32[];
+        for k in count * 3 {
+            points.push(0.0);
+        }
+        for i in n {
+            for k in 3 {
+                points[part[i] * 3 + k] = clusters[i].bounds.center[k];
+            }
+        }
+        order := meshopt::spatial_sort_remap(&points, count, 3);
+        for i in n {
+            part[i] = order[part[i]];
+        }
+    }
+    mut offsets = u64[];
+    for i in count + 1 {
+        offsets.push(0);
+    }
+    for i in n {
+        offsets[part[i] + 1] += 1;
+    }
+    for i in count {
+        offsets[i + 1] += offsets[i];
+    }
+    mut write = offsets.copy();
+    mut slot = u64[];
+    for i in n {
+        slot.push(0);
+    }
+    for i in n {
+        slot[write[part[i]]] = i;
+        write[part[i]] += 1;
+    }
+    mut result = Work[];
+    for i in n {
+        result.push(copy_work(&clusters[slot[i]]));
+    }
+    *clusters = result;
+    return offsets;
+}
+
+// lockBoundary: vertices shared by two groups get the lock bit (consistently across vertices
+// with the same position); bit 7 is scratch for "seen by an earlier group".
+fn lock_boundary<a, b>(locks: (&a mut u8[]), clusters: (&b Work[]), offsets: (&b u64[]), cluster_indices: (&b u64[]), remap: (&b u64[]), vertex_lock: (&b u8[])) {
+    for i in locks.len() {
+        locks[i] = locks[i] & 126;
+    }
+    for g in offsets.len() - 1 {
+        for j in offsets[g + 1] - offsets[g] {
+            c := &clusters[offsets[g] + j];
+            for k in c.index_count {
+                r := remap[cluster_indices[c.index_offset + k]];
+                locks[r] = locks[r] | (locks[r] >> 7);
+            }
+        }
+        for j in offsets[g + 1] - offsets[g] {
+            c := &clusters[offsets[g] + j];
+            for k in c.index_count {
+                r := remap[cluster_indices[c.index_offset + k]];
+                locks[r] = locks[r] | 128;
+            }
+        }
+    }
+    for i in locks.len() {
+        r := remap[i];
+        locks[i] = (locks[r] & 1) | (locks[i] & meshopt::VERTEX_PROTECT);
+        if vertex_lock.len() != 0 {
+            locks[i] = locks[i] | vertex_lock[i];
+        }
+    }
+}
+
+// simplifyFallback: sloppy simplification of the de-indexed subset (simplify_sloppy has no sparse
+// mode), with the error made absolute and the original indices restored.
+fn simplify_fallback<a, b>(mesh: (&a Mesh), indices: (&b u64[]), locks: (&a u8[]), target: u64) -> meshopt::Simplified {
+    mut subset = f32[];
+    mut subset_locks = u8[];
+    mut lod = u64[];
+    for i in indices.len() {
+        v := indices[i];
+        for k in 3 {
+            subset.push(mesh.positions[v * mesh.stride + k]);
+        }
+        subset_locks.push(locks[v]);
+        lod.push(i);
+    }
+    r := meshopt::simplify_sloppy(&lod, &subset, indices.len(), 3, &subset_locks, target, flt_max());
+    error := r.error * meshopt::simplify_scale(&subset, indices.len(), 3);
+    mut out = u64[];
+    for i in r.indices.len() {
+        out.push(indices[r.indices[i]]);
+    }
+    return meshopt::Simplified { indices: out, error: error };
+}
+
+fn edge_sq<a>(p: (&a f32[]), a: u64, b: u64, stride: u64) -> f32 {
+    dx := p[a * stride] - p[b * stride];
+    dy := p[a * stride + 1] - p[b * stride + 1];
+    dz := p[a * stride + 2] - p[b * stride + 2];
+    return dx * dx + dy * dy + dz * dz;
+}
+
+// simplify: attribute-aware sparse simplification with the permissive and sloppy fallbacks, the
+// degenerate-output guard and the optional edge-length error limit.
+fn simplify_group<a, b>(config: (&a Config), mesh: (&a Mesh), indices: (&b u64[]), locks: (&a u8[]), target: u64) -> meshopt::Simplified {
+    mut options = meshopt::SIMPLIFY_SPARSE | meshopt::SIMPLIFY_ERROR_ABSOLUTE;
+    if config.simplify_error_clamped {
+        options = options | meshopt::SIMPLIFY_ERROR_CLAMPED;
+    }
+    if config.simplify_permissive {
+        options = options | meshopt::SIMPLIFY_PERMISSIVE;
+    }
+    if config.simplify_regularize {
+        options = options | meshopt::SIMPLIFY_REGULARIZE;
+    }
+    if config.simplify_preserve_folds {
+        options = options | meshopt::SIMPLIFY_PRESERVE_FOLDS;
+    }
+    mut lod = u64[];
+    mut error: f32 = 0.0;
+    match meshopt::simplify(&indices, &mesh.positions, mesh.vertex_count, mesh.stride, &mesh.attributes, mesh.attribute_stride, &mesh.weights, &locks, target, flt_max(), options) {
+        Some(r) => {
+            lod = r.indices.copy();
+            error = r.error;
+        },
+        None => {
+        }
+    }
+    if (target < lod.len()) && config.simplify_fallback_permissive && (config.simplify_permissive == false) {
+        match meshopt::simplify(&indices, &mesh.positions, mesh.vertex_count, mesh.stride, &mesh.attributes, mesh.attribute_stride, &mesh.weights, &locks, target, flt_max(), options | meshopt::SIMPLIFY_PERMISSIVE) {
+            Some(r) => {
+                lod = r.indices.copy();
+                error = r.error;
+            },
+            None => {
+            }
+        }
+    }
+    if (target < lod.len()) && config.simplify_fallback_sloppy {
+        r := simplify_fallback(&mesh, &indices, &locks, target);
+        lod = r.indices.copy();
+        error = r.error * config.simplify_error_factor_sloppy;
+    }
+    if (lod.len() == 0) && (indices.len() != 0) {
+        lod = span(&indices, 0, 3);
+    }
+    if config.simplify_error_edge_limit > 0.0 {
+        mut max_edge_sq: f32 = 0.0;
+        for t in indices.len() / 3 {
+            a := indices[t * 3];
+            b := indices[t * 3 + 1];
+            c := indices[t * 3 + 2];
+            eab := edge_sq(&mesh.positions, a, b, mesh.stride);
+            eac := edge_sq(&mesh.positions, a, c, mesh.stride);
+            ebc := edge_sq(&mesh.positions, b, c, mesh.stride);
+            emax := fmax(fmax(eab, eac), ebc);
+            emin := fmin(fmin(eab, eac), ebc);
+            quarter: f32 := 4.0;
+            max_edge_sq = fmax(max_edge_sq, fmax(emin, emax / quarter));
+        }
+        error = fmin(error, max_edge_sq.sqrt() * config.simplify_error_edge_limit);
+    }
+    return meshopt::Simplified { indices: lod, error: error };
+}
+
+// outputGroup: records the group and its clusters (with precise bounds for simplified clusters
+// when optimize_bounds is set); returns the group's id.
+fn output_group<a, b>(lod: (&a mut Lod), config: (&b Config), mesh: (&b Mesh), group: (&b Work[]), first: u64, size: u64, cluster_indices: (&b u64[]), simplified: (&b Bounds), depth: u64) -> i64 {
+    id := lod.groups.len();
+    lod.groups.push(Group { depth: depth, simplified: copy_bounds(&simplified), first: lod.clusters.len(), count: size });
+    for i in size {
+        w := &group[first + i];
+        idx := span(&cluster_indices, w.index_offset, w.index_offset + w.index_count);
+        mut bounds = copy_bounds(&w.bounds);
+        if config.optimize_bounds && (w.refined != -1) {
+            bounds = bounds_compute(&mesh, &idx, w.bounds.error);
+        }
+        mut snapshot = f32[];
+        if config.simplify_dilate_borders {
+            for j in idx.len() {
+                for k in 3 {
+                    snapshot.push(mesh.positions[idx[j] * mesh.stride + k]);
+                }
+            }
+        }
+        lod.clusters.push(Cluster { refined: w.refined, bounds: bounds, indices: idx, vertex_count: w.vertices, positions: snapshot });
+    }
+    return i64(id);
+}
+
+fn edge_id(a: u64, b: u64) -> u64 {
+    return (a << 32) | b;
+}
+
+fn corner(t: u64, e: u64) -> u64 {
+    if e == 2 {
+        return t * 3;
+    }
+    return t * 3 + e + 1;
+}
+
+// boundaryArea: the area of triangles with an unlocked open edge (whose reverse edge is absent);
+// `edges` is left holding this index list's directed edges.
+fn boundary_area<a, b>(mesh: (&a Mesh), indices: (&b u64[]), locks: (&a u8[]), remap: (&a u64[]), edges: (&b mut [u64: u64])) -> f32 {
+    *edges = [u64: u64]();
+    for t in indices.len() / 3 {
+        for e in 3 {
+            id := edge_id(remap[indices[t * 3 + e]], remap[indices[corner(t, e)]]);
+            edges.insert(id, 1);
+        }
+    }
+    mut area: f32 = 0.0;
+    for t in indices.len() / 3 {
+        mut border = false;
+        for e in 3 {
+            a := remap[indices[t * 3 + e]];
+            b := remap[indices[corner(t, e)]];
+            if ((locks[a] & locks[b] & 1) == 0) && (edges.contains(&edge_id(b, a)) == false) {
+                border = true;
+            }
+        }
+        if border == false {
+            continue;
+        }
+        s := mesh.stride;
+        p := &mesh.positions;
+        ia := indices[t * 3] * s;
+        ib := indices[t * 3 + 1] * s;
+        ic := indices[t * 3 + 2] * s;
+        abx := p[ib] - p[ia];
+        aby := p[ib + 1] - p[ia + 1];
+        abz := p[ib + 2] - p[ia + 2];
+        acx := p[ic] - p[ia];
+        acy := p[ic + 1] - p[ia + 1];
+        acz := p[ic + 2] - p[ia + 2];
+        nx := aby * acz - abz * acy;
+        ny := abz * acx - abx * acz;
+        nz := abx * acy - aby * acx;
+        sq := nx * nx + ny * ny + nz * nz;
+        half: f32 := 0.5;
+        area = area + sq.sqrt() * half;
+    }
+    return area;
+}
+
+// dilateBorders: pushes unlocked open-border vertices of the simplified group outward (by the
+// lost area over the border perimeter, along miter-extended edge normals) and grows the group
+// sphere to contain them.
+fn dilate_borders<a, b>(mesh: (&a mut Mesh), merged: (&b u64[]), simplified: (&b u64[]), locks: (&b u8[]), remap: (&b u64[]), bounds: (&a mut Bounds), offsets: (&a mut f32[])) {
+    mut edges = [u64: u64]();
+    old_area := boundary_area(&mesh, &merged, &locks, &remap, &mut edges);
+    if old_area == 0.0 {
+        return ();
+    }
+    new_area := boundary_area(&mesh, &simplified, &locks, &remap, &mut edges);
+    quarter: f32 := 4.0;
+    if (new_area >= old_area) || (new_area < old_area / quarter) {
+        return ();
+    }
+    s := mesh.stride;
+    mut perimeter: f32 = 0.0;
+    for t in simplified.len() / 3 {
+        for e in 3 {
+            a := remap[simplified[t * 3 + e]];
+            b := remap[simplified[corner(t, e)]];
+            if ((locks[a] & locks[b] & 1) != 0) || edges.contains(&edge_id(b, a)) {
+                continue;
+            }
+            va := simplified[t * 3 + e] * s;
+            vb := simplified[corner(t, e)] * s;
+            vc := simplified[t * 3 + (e + 2) % 3] * s;
+            p := &mesh.positions;
+            evx := p[vb] - p[va];
+            evy := p[vb + 1] - p[va + 1];
+            evz := p[vb + 2] - p[va + 2];
+            el2 := evx * evx + evy * evy + evz * evz;
+            el := el2.sqrt();
+            cvx := p[va] - p[vc];
+            cvy := p[va + 1] - p[vc + 1];
+            cvz := p[va + 2] - p[vc + 2];
+            mut denom: f32 = 1.0;
+            if el > 0.0 {
+                denom = el * el;
+            }
+            cp := (cvx * evx + cvy * evy + cvz * evz) / denom;
+            nvx := cvx - evx * cp;
+            nvy := cvy - evy * cp;
+            nvz := cvz - evz * cp;
+            nl2 := nvx * nvx + nvy * nvy + nvz * nvz;
+            nl := nl2.sqrt();
+            mut ns: f32 = 0.0;
+            if nl > 0.0 {
+                ns = el / nl;
+            }
+            if (locks[a] & 1) == 0 {
+                offsets[a * 4] += nvx * ns;
+                offsets[a * 4 + 1] += nvy * ns;
+                offsets[a * 4 + 2] += nvz * ns;
+                offsets[a * 4 + 3] += el;
+            }
+            if (locks[b] & 1) == 0 {
+                offsets[b * 4] += nvx * ns;
+                offsets[b * 4 + 1] += nvy * ns;
+                offsets[b * 4 + 2] += nvz * ns;
+                offsets[b * 4 + 3] += el;
+            }
+            perimeter = perimeter + el;
+        }
+    }
+    mut distance: f32 = 0.0;
+    if perimeter > 0.0 {
+        distance = (old_area - new_area) / perimeter;
+    }
+    for i in simplified.len() {
+        r := remap[simplified[i]];
+        if (locks[r] & 1) != 0 {
+            continue;
+        }
+        if offsets[r * 4 + 3] > 0.0 {
+            nx := offsets[r * 4] / offsets[r * 4 + 3];
+            ny := offsets[r * 4 + 1] / offsets[r * 4 + 3];
+            nz := offsets[r * 4 + 2] / offsets[r * 4 + 3];
+            nn := nx * nx + ny * ny + nz * nz;
+            mut floor: f32 = 0.15;
+            if nn > floor {
+                floor = nn;
+            }
+            ns := distance / floor;
+            mesh.positions[r * s] += nx * ns;
+            mesh.positions[r * s + 1] += ny * ns;
+            mesh.positions[r * s + 2] += nz * ns;
+            for k in 4 {
+                offsets[r * 4 + k] = 0.0;
+            }
+            dx := mesh.positions[r * s] - bounds.center[0];
+            dy := mesh.positions[r * s + 1] - bounds.center[1];
+            dz := mesh.positions[r * s + 2] - bounds.center[2];
+            d2 := dx * dx + dy * dy + dz * dz;
+            bounds.radius = fmax(bounds.radius, d2.sqrt());
+        }
+        vi := simplified[i] * s;
+        for k in 3 {
+            mesh.positions[vi + k] = mesh.positions[r * s + k];
+        }
+    }
+}
+
+// clodBuild: clusters the mesh, then repeatedly groups, simplifies and re-clusters until one
+// cluster remains or every group is stuck. None for the non-spatial clusterizer, which is not
+// ported (meshopt_buildMeshletsFlex).
+pub fn build<a, b>(config: (&a Config), mesh: (&b mut Mesh)) -> Lod? {
+    if config.cluster_spatial == false {
+        return None;
+    }
+    mut lod = Lod { groups: Group[], clusters: Cluster[] };
+    n := mesh.vertex_count;
+    mut locks = u8[];
+    for i in n {
+        locks.push(0);
+    }
+    remap := meshopt::generate_position_remap(&mesh.positions, n, mesh.stride);
+    if mesh.protect_mask != 0 {
+        width := mesh.attribute_stride;
+        for i in n {
+            r := remap[i];
+            for j in width {
+                if (r != i) && ((mesh.protect_mask & (1 << j)) != 0) && (mesh.attributes[i * width + j] != mesh.attributes[r * width + j]) {
+                    locks[i] = locks[i] | meshopt::VERTEX_PROTECT;
+                }
+            }
+        }
+    }
+    mut dilate = f32[];
+    if config.simplify_dilate_borders {
+        for i in n * 4 {
+            dilate.push(0.0);
+        }
+    }
+    mut cluster_indices = u64[];
+    mut clusters = Work[];
+    clusterize(&mut clusters, &mut cluster_indices, &config, &mesh, &mesh.indices, -1);
+    for i in clusters.len() {
+        idx := span(&cluster_indices, clusters[i].index_offset, clusters[i].index_offset + clusters[i].index_count);
+        clusters[i].bounds = bounds_compute(&mesh, &idx, 0.0);
+    }
+    mut depth: u64 = 0;
+    while clusters.len() > 1 {
+        offsets := partition(&mut clusters, &config, &mesh, &cluster_indices, &remap);
+        mut pending = Work[];
+        mut pending_indices = u64[];
+        lock_boundary(&mut locks, &clusters, &offsets, &cluster_indices, &remap, &mesh.lock);
+        for g in offsets.len() - 1 {
+            first := offsets[g];
+            size := offsets[g + 1] - first;
+            mut merged = u64[];
+            mut spheres = Bounds[];
+            for j in size {
+                w := &clusters[first + j];
+                for k in w.index_count {
+                    merged.push(cluster_indices[w.index_offset + k]);
+                }
+                spheres.push(copy_bounds(&w.bounds));
+            }
+            target := u64(i64(count_f(merged.len() / 3) * config.simplify_ratio)) * 3;
+            mut bounds = bounds_merge(&spheres);
+            s := simplify_group(&config, &mesh, &merged, &locks, target);
+            if count_f(s.indices.len()) > count_f(merged.len()) * config.simplify_threshold {
+                bounds.error = flt_max();
+                output_group(&mut lod, &config, &mesh, &clusters, first, size, &cluster_indices, &bounds, depth);
+                continue;
+            }
+            bounds.error = fmax(bounds.error * config.simplify_error_merge_previous, s.error) + s.error * config.simplify_error_merge_additive;
+            refined := output_group(&mut lod, &config, &mesh, &clusters, first, size, &cluster_indices, &bounds, depth);
+            if config.simplify_dilate_borders {
+                dilate_borders(&mut mesh, &merged, &s.indices, &locks, &remap, &mut bounds, &mut dilate);
+            }
+            start := pending.len();
+            clusterize(&mut pending, &mut pending_indices, &config, &mesh, &s.indices, refined);
+            for j in pending.len() - start {
+                pending[start + j].bounds = copy_bounds(&bounds);
+            }
+        }
+        clusters = pending;
+        cluster_indices = pending_indices;
+        depth += 1;
+    }
+    if clusters.len() != 0 {
+        mut bounds = copy_bounds(&clusters[0].bounds);
+        bounds.error = flt_max();
+        output_group(&mut lod, &config, &mesh, &clusters, 0, clusters.len(), &cluster_indices, &bounds, depth);
+    }
+    return Some(lod);
+}
+
+// clodLocalIndices: meshlet-local vertices and byte triangles of a cluster's indices.
+pub fn local_indices<a>(indices: (&a u64[])) -> meshopt::Meshlets {
+    return meshopt::extract_meshlet_indices(&indices);
+}
+
+// clodBuildHierarchyBound
+pub fn build_hierarchy_bound(group_count: u64, node_width: u64, level_count: u64) -> u64 {
+    mut total = level_count;
+    mut frontier = group_count;
+    while frontier > 1 {
+        total += frontier + level_count;
+        frontier = (frontier + node_width - 1) / node_width;
+    }
+    return total;
+}
+
+fn copy_node<a>(n: (&a Node)) -> Node {
+    return Node { bounds: copy_bounds(&n.bounds), group: n.group, child_offset: n.child_offset, child_count: n.child_count };
+}
+
+// clodBuildHierarchy: one BVH per DAG level over the groups at that level (spatially clustered
+// node_width at a time); nodes[0..level_count) are the per-level roots.
+pub fn build_hierarchy<a>(groups: (&a Group[]), node_width: u64, level_count: u64) -> Node[] {
+    mut nodes = Node[];
+    for i in build_hierarchy_bound(groups.len(), node_width, level_count) {
+        nodes.push(Node { bounds: Bounds { center: f32[0.0, 0.0, 0.0], radius: 0.0, error: 0.0 }, group: 0, child_offset: 0, child_count: 0 });
+    }
+    mut offset = level_count;
+    for level in level_count {
+        mut row = Node[];
+        for i in groups.len() {
+            if groups[i].depth == level {
+                row.push(Node { bounds: copy_bounds(&groups[i].simplified), group: i64(i), child_offset: 0, child_count: 0 });
+            }
+        }
+        while row.len() > 1 {
+            count := row.len();
+            mut centers = f32[];
+            for i in count {
+                for k in 3 {
+                    centers.push(row[i].bounds.center[k]);
+                }
+            }
+            order := meshopt::spatial_cluster_points(&centers, count, 3, node_width);
+            for i in count {
+                nodes[offset + i] = copy_node(&row[order[i]]);
+            }
+            row = Node[];
+            mut i: u64 = 0;
+            while i < count {
+                mut children = count - i;
+                if node_width < children {
+                    children = node_width;
+                }
+                mut spheres = Bounds[];
+                for k in children {
+                    spheres.push(copy_bounds(&nodes[offset + i + k].bounds));
+                }
+                row.push(Node { bounds: bounds_merge(&spheres), group: -1, child_offset: offset + i, child_count: children });
+                i += node_width;
+            }
+            offset += count;
+        }
+        nodes[level] = copy_node(&row[0]);
+    }
+    mut out = Node[];
+    for i in offset {
+        out.push(copy_node(&nodes[i]));
+    }
+    return out;
+}

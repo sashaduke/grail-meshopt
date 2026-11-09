@@ -1,0 +1,205 @@
+// Checks clod::build and clod::build_hierarchy (meshoptimizer's demo/clusterlod.h) against the C++
+// library: every group, cluster (bounds, indices), dilation snapshot, final position and hierarchy
+// node, floats as bits (tests/reference/clusterlod.cpp -> tests/clusterlod_expected.txt). Returns
+// the number of failures.
+use meshopt;
+use clod;
+use collections;
+use fs;
+use io;
+
+// Checks simplify_sloppy (meshopt_simplifySloppy) and simplify_scale (meshopt_simplifyScale): every
+// output index and the error and scale bits against meshoptimizer
+// (tests/reference/simplify_sloppy.cpp -> tests/clusterlod_expected.txt). Returns the number of
+// failures.
+
+fn read_all<a>(path: &a [u8]) -> u8[] {
+    match fs::read(path) {
+        d: u8[] => { return d; },
+        e: io::Error => { println("cannot read tests/clusterlod_expected.txt"); return u8[]; }
+    }
+}
+fn number<a>(text: &a [u8]) -> u64 {
+    mut v: u64 = 0;
+    mut neg = false;
+    for i in text.len() {
+        if text[i] == 45 {
+            neg = true;
+        } else {
+            v = v * 10 + (text[i] - 48);
+        }
+    }
+    return v;
+}
+fn signed<a>(text: &a [u8]) -> i64 {
+    if text[0] == 45 {
+        return 0 - i64(number(&text[1: text.len()]));
+    }
+    return i64(number(&text));
+}
+fn same<a, b>(x: &a [u8], y: &b [u8]) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    for i in x.len() {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+fn bounds_match<a, b>(got: (&a clod::Bounds), f: (&b u8[][]), at: u64) -> bool {
+    mut ok = true;
+    for k in 3 {
+        ok = ok && (f32_bits(got.center[k]) == number(&f[at + k]));
+    }
+    return ok && (f32_bits(got.radius) == number(&f[at + 3])) && (f32_bits(got.error) == number(&f[at + 4]));
+}
+
+fn main() -> u64 {
+    text := read_all("tests/clusterlod_expected.txt");
+    mut failures: u64 = 0;
+    mut checks: u64 = 0;
+    mut config = clod::default_config(64);
+    mut mesh = clod::Mesh { indices: u64[], vertex_count: 0, positions: f32[], stride: 3, attributes: f32[], attribute_stride: 5, lock: u8[], weights: f32[0.5, 0.5, 0.5], protect_mask: 0 };
+    mut lod = clod::Lod { groups: clod::Group[], clusters: clod::Cluster[] };
+    mut nodes = clod::Node[];
+    mut name = u8[];
+    mut gi: u64 = 0;
+    mut ci: u64 = 0;
+    mut ni: u64 = 0;
+    mut start: u64 = 0;
+    for i in text.len() {
+        if text[i] != 10 {
+            continue;
+        }
+        mut f = u8[][];
+        mut s = start;
+        while s < i {
+            mut e = s;
+            while (e < i) && (text[e] != 32) {
+                e += 1;
+            }
+            f.push(text[s: e].copy());
+            s = e + 1;
+        }
+        start = i + 1;
+        tag := f[0].copy();
+        if same(&tag, "case") {
+            name = f[1].copy();
+            config = clod::default_config(number(&f[4]));
+            config.max_vertices = number(&f[2]);
+            config.min_triangles = number(&f[3]);
+            config.partition_size = number(&f[5]);
+            flags := number(&f[6]);
+            config.partition_sort = (flags & 1) != 0;
+            config.optimize_bounds = (flags & 2) != 0;
+            config.simplify_dilate_borders = (flags & 4) != 0;
+            config.simplify_preserve_folds = (flags & 8) != 0;
+            config.cluster_spatial = true;
+            config.cluster_fill_weight = f32_from_bits(number(&f[7]));
+            config.simplify_ratio = f32_from_bits(number(&f[8]));
+            mesh.protect_mask = number(&f[9]);
+            config.simplify_error_edge_limit = f32_from_bits(number(&f[11]));
+            config.simplify_error_merge_additive = f32_from_bits(number(&f[12]));
+            continue;
+        }
+        if same(&tag, "pos") {
+            mesh.vertex_count = number(&f[1]);
+            mesh.positions = f32[];
+            for k in mesh.vertex_count * 3 {
+                mesh.positions.push(f32_from_bits(number(&f[k + 2])));
+            }
+            continue;
+        }
+        if same(&tag, "idx") {
+            mesh.indices = u64[];
+            for k in number(&f[1]) {
+                mesh.indices.push(number(&f[k + 2]));
+            }
+            continue;
+        }
+        if same(&tag, "attr") {
+            mesh.attributes = f32[];
+            for k in number(&f[1]) {
+                mesh.attributes.push(f32_from_bits(number(&f[k + 2])));
+            }
+            continue;
+        }
+        if same(&tag, "lock") {
+            mesh.lock = u8[];
+            for k in number(&f[1]) {
+                mesh.lock.push(number(&f[k + 2]));
+            }
+            match clod::build(&config, &mut mesh) {
+                Some(built) => {
+                    lod = built;
+                },
+                None => {
+                    println("FAIL {}: build refused", name.text());
+                    failures += 1;
+                }
+            }
+            gi = 0;
+            ci = 0;
+            ni = 0;
+            continue;
+        }
+        checks += 1;
+        mut ok = true;
+        if same(&tag, "group") {
+            ok = gi < lod.groups.len();
+            if ok {
+                g := &lod.groups[gi];
+                ok = (g.depth == number(&f[1])) && (g.count == number(&f[2])) && bounds_match(&g.simplified, &f, 3) && (g.first == ci);
+            }
+            gi += 1;
+        }
+        if same(&tag, "cluster") {
+            ok = ci < lod.clusters.len();
+            if ok {
+                c := &lod.clusters[ci];
+                count := number(&f[8]);
+                ok = (c.refined == signed(&f[1])) && bounds_match(&c.bounds, &f, 2) && (c.vertex_count == number(&f[7])) && (c.indices.len() == count);
+                for k in count {
+                    ok = ok && (c.indices[k] == number(&f[9 + k]));
+                }
+            }
+            ci += 1;
+        }
+        if same(&tag, "cpos") {
+            c := &lod.clusters[ci - 1];
+            ok = c.positions.len() == f.len() - 1;
+            for k in f.len() - 1 {
+                ok = ok && (f32_bits(c.positions[k]) == number(&f[k + 1]));
+            }
+        }
+        if same(&tag, "final") {
+            ok = mesh.positions.len() == f.len() - 1;
+            for k in f.len() - 1 {
+                ok = ok && (f32_bits(mesh.positions[k]) == number(&f[k + 1]));
+            }
+        }
+        if same(&tag, "nodes") {
+            nodes = clod::build_hierarchy(&lod.groups, 4, number(&f[2]));
+            ok = nodes.len() == number(&f[1]);
+        }
+        if same(&tag, "node") {
+            ok = ni < nodes.len();
+            if ok {
+                n := &nodes[ni];
+                ok = (n.group == signed(&f[1])) && (n.child_offset == number(&f[2])) && (n.child_count == number(&f[3])) && bounds_match(&n.bounds, &f, 4);
+            }
+            ni += 1;
+        }
+        if same(&tag, "end") {
+            ok = (gi == lod.groups.len()) && (ci == lod.clusters.len()) && (ni == nodes.len());
+        }
+        if ok == false {
+            println("FAIL {} {} (group {}, cluster {}, node {})", name.text(), tag.text(), gi, ci, ni);
+            failures += 1;
+        }
+    }
+    println("{} checks, {} failures", checks, failures);
+    return failures;
+}
