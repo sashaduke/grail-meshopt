@@ -31,8 +31,9 @@ Ported so far:
 - `compute_cluster_bounds`, `extract_meshlet_indices`, `optimize_meshlet_level`
   (meshopt_computeClusterBounds / extractMeshletIndices / optimizeMeshletLevel)
 
-In progress: `simplify_sloppy` and `simplify_scale`, the remaining pieces of Abundance's cluster LOD
-path, which together
+- `simplify_sloppy`, `simplify_scale` (meshopt_simplifySloppy / meshopt_simplifyScale)
+
+Together these cover every meshoptimizer call in Abundance's cluster LOD builder (clusterlod.h)., which together
 with the above back Abundance's cluster LOD builder.
 
 ## Use

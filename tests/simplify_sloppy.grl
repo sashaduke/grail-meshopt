@@ -1,0 +1,119 @@
+use meshopt;
+use collections;
+use fs;
+use io;
+
+// Checks simplify_sloppy (meshopt_simplifySloppy) and simplify_scale (meshopt_simplifyScale): every
+// output index and the error and scale bits against meshoptimizer
+// (tests/reference/simplify_sloppy.cpp -> tests/simplify_sloppy_expected.txt). Returns the number of
+// failures.
+
+fn read_all<a>(path: &a [u8]) -> u8[] {
+    match fs::read(path) {
+        d: u8[] => { return d; },
+        e: io::Error => { println("cannot read tests/simplify_sloppy_expected.txt"); return u8[]; }
+    }
+}
+fn number<a>(text: &a [u8]) -> u64 {
+    mut v: u64 = 0;
+    mut neg = false;
+    for i in text.len() {
+        if text[i] == 45 {
+            neg = true;
+        } else {
+            v = v * 10 + (text[i] - 48);
+        }
+    }
+    return v;
+}
+fn signed<a>(text: &a [u8]) -> i64 {
+    if text[0] == 45 {
+        return 0 - i64(number(&text[1: text.len()]));
+    }
+    return i64(number(&text));
+}
+fn same<a, b>(x: &a [u8], y: &b [u8]) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    for i in x.len() {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+fn main() -> u64 {
+    text := read_all("tests/simplify_sloppy_expected.txt");
+    mut failures: u64 = 0;
+    mut checks: u64 = 0;
+    mut pos = f32[];
+    mut count: u64 = 0;
+    mut idx = u64[];
+    mut lock = u8[];
+    mut start: u64 = 0;
+    for i in text.len() {
+        if text[i] != 10 {
+            continue;
+        }
+        mut f = u8[][];
+        mut s = start;
+        while s < i {
+            mut e = s;
+            while (e < i) && (text[e] != 32) {
+                e += 1;
+            }
+            f.push(text[s: e].copy());
+            s = e + 1;
+        }
+        start = i + 1;
+        tag := f[0].copy();
+        if same(&tag, "pos") {
+            count = number(&f[1]);
+            pos = f32[];
+            for k in count * 4 {
+                pos.push(f32_from_bits(number(&f[k + 2])));
+            }
+            continue;
+        }
+        if same(&tag, "idx") {
+            idx = u64[];
+            for k in number(&f[1]) {
+                idx.push(number(&f[k + 2]));
+            }
+            continue;
+        }
+        if same(&tag, "lock") {
+            lock = u8[];
+            for k in number(&f[1]) {
+                lock.push(number(&f[k + 2]));
+            }
+            continue;
+        }
+        checks += 1;
+        if same(&tag, "scale") {
+            got := meshopt::simplify_scale(&pos, count, 4);
+            if f32_bits(got) != number(&f[1]) {
+                println("FAIL scale: {} want {}", f32_bits(got), number(&f[1]));
+                failures += 1;
+            }
+            continue;
+        }
+        target := number(&f[1]);
+        limit := f32_from_bits(number(&f[2]));
+        n := number(&f[3]);
+        r := meshopt::simplify_sloppy(&idx, &pos, count, 4, &lock, target, limit);
+        mut ok = (r.indices.len() == n) && (f32_bits(r.error) == number(&f[4]));
+        if ok {
+            for k in n {
+                ok = ok && (r.indices[k] == number(&f[5 + k]));
+            }
+        }
+        if ok == false {
+            println("FAIL sloppy target={} limit={} locked={}: {} indices (want {}), error {} want {}", target, number(&f[2]), lock.len() != 0, r.indices.len(), n, f32_bits(r.error), number(&f[4]));
+            failures += 1;
+        }
+    }
+    println("{} checks, {} failures", checks, failures);
+    return failures;
+}
