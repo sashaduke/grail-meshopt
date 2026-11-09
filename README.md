@@ -15,9 +15,11 @@ Ported so far:
   SNORM form)
 - `build_meshlets_spatial` and `build_meshlets_bound` (meshopt_buildMeshletsSpatial: SAH-split
   BVH clusters, as Abundance's cluster builder uses them)
+- `partition_clusters` (meshopt_partitionClusters, with or without positions; the partition count
+  is appended as the last element)
 
-In progress: cluster partitioning, spatial sort and clustering, meshlet optimisation and the
-simplifier, which together with the above back Abundance's cluster LOD builder.
+In progress: spatial sort and clustering, meshlet optimisation and the simplifier, which together
+with the above back Abundance's cluster LOD builder.
 
 ## Use
 
@@ -32,7 +34,9 @@ Positions are flat `f32` arrays with a stride in floats (`4` for `float4` elemen
 `grail test` compares every result with meshoptimizer on inputs printed by the programs in
 `tests/reference/`: `basics.cpp` (duplicates, signed zeros, NaN positions, degenerate and curved
 meshlets; floats compared as their 32-bit patterns) and `meshlets.cpp` (a height field, a random
-soup and a torus under Abundance's 128/42..128/0.5 parameters and three others).
+soup and a torus under Abundance's 128/42..128/0.5 parameters and three others) and
+`partition.cpp` (spatial meshlets of two meshes partitioned at three target sizes, with and
+without positions).
 
 ```sh
 M=<meshoptimizer>

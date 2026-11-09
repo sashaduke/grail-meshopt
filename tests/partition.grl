@@ -1,0 +1,117 @@
+use meshopt;
+use collections;
+use fs;
+use io;
+
+// Checks partition_clusters against meshopt_partitionClusters (tests/reference/partition.cpp ->
+// tests/partition_expected.txt), with and without positions, for several target sizes. Returns the
+// number of failures.
+
+fn read_all<a>(path: &a [u8]) -> u8[] {
+    match fs::read(path) {
+        d: u8[] => { return d; },
+        e: io::Error => { println("cannot read tests/partition_expected.txt"); return u8[]; }
+    }
+}
+fn number<a>(text: &a [u8]) -> u64 {
+    mut v: u64 = 0;
+    mut neg = false;
+    for i in text.len() {
+        if text[i] == 45 {
+            neg = true;
+        } else {
+            v = v * 10 + (text[i] - 48);
+        }
+    }
+    return v;
+}
+fn signed<a>(text: &a [u8]) -> i64 {
+    if text[0] == 45 {
+        return 0 - i64(number(&text[1: text.len()]));
+    }
+    return i64(number(&text));
+}
+fn same<a, b>(x: &a [u8], y: &b [u8]) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    for i in x.len() {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+fn main() -> u64 {
+    text := read_all("tests/partition_expected.txt");
+    mut failures: u64 = 0;
+    mut checks: u64 = 0;
+    mut pos = f32[];
+    mut count: u64 = 0;
+    mut counts = u64[];
+    mut idx = u64[];
+    mut start: u64 = 0;
+    for i in text.len() {
+        if text[i] != 10 {
+            continue;
+        }
+        mut f = u8[][];
+        mut s = start;
+        while s < i {
+            mut e = s;
+            while (e < i) && (text[e] != 32) {
+                e += 1;
+            }
+            f.push(text[s: e].copy());
+            s = e + 1;
+        }
+        start = i + 1;
+        tag := f[0].copy();
+        if same(&tag, "pos") {
+            count = number(&f[1]);
+            pos = f32[];
+            for k in count * 4 {
+                pos.push(f32_from_bits(number(&f[k + 2])));
+            }
+            continue;
+        }
+        if same(&tag, "clusters") {
+            n := number(&f[1]);
+            counts = u64[];
+            mut total: u64 = 0;
+            for k in n {
+                c := number(&f[k + 2]);
+                counts.push(c);
+                total += c;
+            }
+            idx = u64[];
+            for k in total {
+                idx.push(number(&f[n + 2 + k]));
+            }
+            continue;
+        }
+        checks += 1;
+        target := number(&f[1]);
+        spatial := number(&f[2]);
+        mut p = f32[];
+        if spatial != 0 {
+            for k in pos.len() {
+                p.push(pos[k]);
+            }
+        }
+        got := meshopt::partition_clusters(&idx, &counts, &p, count, 4, target);
+        n := counts.len();
+        mut ok = got[n] == number(&f[3]);
+        for k in n {
+            if got[k] != number(&f[k + 4]) {
+                ok = false;
+            }
+        }
+        if ok == false {
+            println("FAIL parts target={} spatial={}: {} partitions, want {}", target, spatial, got[n], number(&f[3]));
+            failures += 1;
+        }
+    }
+    println("{} checks, {} failures", checks, failures);
+    return failures;
+}

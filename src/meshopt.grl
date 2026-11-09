@@ -902,3 +902,502 @@ pub fn build_meshlets_spatial<a, b>(indices: (&a u64[]), positions: (&b f32[]), 
     }
     return result;
 }
+
+// ---- cluster partitioning: meshopt_partitionClusters ----
+
+// Cluster groups as parallel arrays (ClusterGroup fields).
+struct Groups {
+    group: i64[],
+    next: i64[],
+    size: u64[],
+    vertices: u64[],
+    cx: f32[],
+    cy: f32[],
+    cz: f32[],
+    radius: f32[]
+}
+
+struct Adjacency {
+    offsets: u64[],
+    clusters: u64[],
+    shared: u64[]
+}
+
+fn merge_bounds<a>(g: (&a mut Groups), t: u64, s: u64) -> unit {
+    r1 := g.radius[t];
+    r2 := g.radius[s];
+    dx := g.cx[s] - g.cx[t];
+    dy := g.cy[s] - g.cy[t];
+    dz := g.cz[s] - g.cz[t];
+    sq: f32 := dx * dx + dy * dy + dz * dz;
+    d: f32 := sq.sqrt();
+    if d + r1 < r2 {
+        g.cx[t] = g.cx[s];
+        g.cy[t] = g.cy[s];
+        g.cz[t] = g.cz[s];
+        g.radius[t] = r2;
+        return ();
+    }
+    if d + r2 > r1 {
+        mut k: f32 = 0.0;
+        two: f32 := 2.0;
+        if d > 0.0 {
+            k = (d + r2 - r1) / (two * d);
+        }
+        g.cx[t] = g.cx[t] + dx * k;
+        g.cy[t] = g.cy[t] + dy * k;
+        g.cz[t] = g.cz[t] + dz * k;
+        g.radius[t] = (d + r2 + r1) / two;
+    }
+    return ();
+}
+
+fn bounds_score<a>(g: (&a Groups), t: u64, s: u64) -> f32 {
+    r1 := g.radius[t];
+    r2 := g.radius[s];
+    dx := g.cx[s] - g.cx[t];
+    dy := g.cy[s] - g.cy[t];
+    dz := g.cz[s] - g.cz[t];
+    sq: f32 := dx * dx + dy * dy + dz * dz;
+    d: f32 := sq.sqrt();
+    two: f32 := 2.0;
+    mut mr: f32 = (d + r2 + r1) / two;
+    if d + r1 < r2 {
+        mr = r2;
+    } else {
+        if d + r2 < r1 {
+            mr = r1;
+        }
+    }
+    if mr > 0.0 {
+        return r1 / mr;
+    }
+    return 0.0;
+}
+
+// Binary min-heap on (id, order), exactly as heapPush/heapPop.
+fn heap_push<a, b>(ids: (&a mut u64[]), orders: (&b mut i64[]), id: u64, order: i64) -> unit {
+    ids.push(id);
+    orders.push(order);
+    mut i = ids.len() - 1;
+    while (i > 0) && (orders[i] < orders[(i - 1) / 2]) {
+        p := (i - 1) / 2;
+        ti := ids[i];
+        to := orders[i];
+        ids[i] = ids[p];
+        orders[i] = orders[p];
+        ids[p] = ti;
+        orders[p] = to;
+        i = p;
+    }
+    return ();
+}
+
+fn heap_pop<a, b>(ids: (&a mut u64[]), orders: (&b mut i64[])) -> u64 {
+    top := ids[0];
+    size := ids.len() - 1;
+    ids[0] = ids[size];
+    orders[0] = orders[size];
+    ids.pop();
+    orders.pop();
+    mut i: u64 = 0;
+    while i * 2 + 1 < size {
+        mut j = i * 2 + 1;
+        if (j + 1 < size) && (orders[j + 1] < orders[j]) {
+            j += 1;
+        }
+        if orders[j] >= orders[i] {
+            break;
+        }
+        ti := ids[i];
+        to := orders[i];
+        ids[i] = ids[j];
+        orders[i] = orders[j];
+        ids[j] = ti;
+        orders[j] = to;
+        i = j;
+    }
+    return top;
+}
+
+fn rsqrt_count(n: u64) -> f32 {
+    one: f32 := 1.0;
+    v: f32 := f32(i64(n));
+    return one / v.sqrt();
+}
+
+// pickGroupToMerge: returns [best_group + 1 (0 = none), best_shared].
+fn pick_group<a, b, c>(g: (&a Groups), id: u64, adj: (&b Adjacency), max_size: u64, use_bounds: bool, acc: (&c mut u64[])) -> u64[] {
+    group_rsqrt := rsqrt_count(g.vertices[id]);
+    mut ci = i64(id);
+    while ci >= 0 {
+        c := u64(ci);
+        mut k = adj.offsets[c];
+        while k != adj.offsets[c + 1] {
+            other := g.group[adj.clusters[k]];
+            if other >= 0 {
+                acc[u64(other)] = acc[u64(other)] + adj.shared[k];
+            }
+            k += 1;
+        }
+        ci = g.next[c];
+    }
+    mut best: u64 = 0;
+    mut best_score: f32 = 0.0;
+    mut best_shared: u64 = 0;
+    weight: f32 := 0.4;
+    one: f32 := 1.0;
+    ci = i64(id);
+    while ci >= 0 {
+        c := u64(ci);
+        mut k = adj.offsets[c];
+        while k != adj.offsets[c + 1] {
+            other_i := g.group[adj.clusters[k]];
+            k += 1;
+            if other_i < 0 {
+                continue;
+            }
+            other := u64(other_i);
+            if acc[other] == 0 {
+                continue;
+            }
+            shared := acc[other];
+            acc[other] = 0;
+            if g.size[id] + g.size[other] > max_size {
+                continue;
+            }
+            other_rsqrt := rsqrt_count(g.vertices[other]);
+            mut score: f32 = f32(i64(shared)) * (group_rsqrt + other_rsqrt);
+            if use_bounds {
+                score = score * (one + weight * bounds_score(&g, id, other));
+            }
+            if score > best_score {
+                best = other + 1;
+                best_score = score;
+                best_shared = shared;
+            }
+        }
+        ci = g.next[c];
+    }
+    return u64[best, best_shared];
+}
+
+fn tail_of<a>(g: (&a Groups), id: u64) -> u64 {
+    mut t = id;
+    while g.next[t] >= 0 {
+        t = u64(g.next[t]);
+    }
+    return t;
+}
+
+fn merge_leaf<a, b>(g: (&a mut Groups), order: (&b u64[]), base: u64, count: u64, sizes: (&b u64[])) -> unit {
+    target := sizes[0];
+    max_size := sizes[1];
+    for i in count {
+        id := order[base + i];
+        if (g.size[id] == 0) || (g.size[id] >= target) {
+            continue;
+        }
+        mut best_score: f32 = -1.0;
+        mut best: u64 = 0;
+        for j in count {
+            other := order[base + j];
+            if (id == other) || (g.size[other] == 0) {
+                continue;
+            }
+            if g.size[id] + g.size[other] > max_size {
+                continue;
+            }
+            score := bounds_score(&g, id, other);
+            if score > best_score {
+                best_score = score;
+                best = other + 1;
+            }
+        }
+        if best != 0 {
+            b := best - 1;
+            t := tail_of(&g, b);
+            g.next[t] = i64(id);
+            g.size[b] = g.size[b] + g.size[id];
+            g.size[id] = 0;
+            merge_bounds(&mut g, b, id);
+            g.radius[id] = 0.0;
+        }
+    }
+    return ();
+}
+
+fn center_of<a>(g: (&a Groups), id: u64, axis: u64) -> f32 {
+    if axis == 0 {
+        return g.cx[id];
+    }
+    if axis == 1 {
+        return g.cy[id];
+    }
+    return g.cz[id];
+}
+
+fn merge_spatial<a, b, c>(g: (&a mut Groups), order: (&b mut u64[]), base: u64, count: u64, sizes: (&c u64[]), depth: u64) -> unit {
+    max_size := sizes[1];
+    leaf: u64 := 8;
+    mut total: u64 = 0;
+    for i in count {
+        total += g.size[order[base + i]];
+    }
+    if (total <= max_size) || (count <= leaf) {
+        merge_leaf(&mut g, &order, base, count, &sizes);
+        return ();
+    }
+    mut mean = f32[0.0, 0.0, 0.0];
+    mut vars = f32[0.0, 0.0, 0.0];
+    one: f32 := 1.0;
+    mut runc: f32 = 1.0;
+    mut runs: f32 = 1.0;
+    for i in count {
+        id := order[base + i];
+        for k in 3 {
+            p := center_of(&g, id, k);
+            delta := p - mean[k];
+            mean[k] = mean[k] + delta * runs;
+            vars[k] = vars[k] + delta * (p - mean[k]);
+        }
+        runc = runc + one;
+        runs = one / runc;
+    }
+    mut axis: u64 = 2;
+    if (vars[0] >= vars[1]) && (vars[0] >= vars[2]) {
+        axis = 0;
+    } else {
+        if vars[1] >= vars[2] {
+            axis = 1;
+        }
+    }
+    split := mean[axis];
+    mut m: u64 = 0;
+    for i in count {
+        v := center_of(&g, order[base + i], axis);
+        t := order[base + m];
+        order[base + m] = order[base + i];
+        order[base + i] = t;
+        if v < split {
+            m += 1;
+        }
+    }
+    mut middle = m;
+    if (middle <= leaf / 2) || (count - middle <= leaf / 2) || (40 <= depth) {
+        middle = count / 2;
+    }
+    merge_spatial(&mut g, &mut order, base, middle, &sizes, depth + 1);
+    merge_spatial(&mut g, &mut order, base + middle, count - middle, &sizes, depth + 1);
+    return ();
+}
+
+// Partitions clusters (each a list of vertex indices; `counts` gives their lengths) into groups of
+// about `target` clusters. Positions empty = no spatial information (NULL in C). Returns the
+// partition id of each cluster with the partition count appended as the last element.
+pub fn partition_clusters<a, b, c>(indices: (&a u64[]), counts: (&a u64[]), positions: (&b f32[]), vertex_count: u64, stride: u64, target: u64) -> u64[] {
+    cluster_count := counts.len();
+    max_size := target + target / 3;
+    // filterClusterIndices: unique vertices per cluster, first-use order.
+    mut used = u8[];
+    for i in vertex_count {
+        used.push(0);
+    }
+    mut data = u64[];
+    mut offsets = u64[];
+    mut start: u64 = 0;
+    for i in cluster_count {
+        offsets.push(data.len());
+        for j in counts[i] {
+            v := indices[start + j];
+            if used[v] == 0 {
+                data.push(v);
+                used[v] = 1;
+            }
+        }
+        for j in data.len() - offsets[i] {
+            used[data[offsets[i] + j]] = 0;
+        }
+        start += counts[i];
+    }
+    offsets.push(data.len());
+    // buildClusterAdjacency
+    mut refc = u64[];
+    for i in vertex_count + 1 {
+        refc.push(0);
+    }
+    for k in data.len() {
+        refc[data[k] + 1] = refc[data[k] + 1] + 1;
+    }
+    for i in vertex_count {
+        refc[i + 1] = refc[i + 1] + refc[i];
+    }
+    mut fill = u64[];
+    for i in vertex_count {
+        fill.push(refc[i]);
+    }
+    mut refs = u64[];
+    for k in data.len() {
+        refs.push(0);
+    }
+    for i in cluster_count {
+        mut j = offsets[i];
+        while j < offsets[i + 1] {
+            v := data[j];
+            refs[fill[v]] = i;
+            fill[v] = fill[v] + 1;
+            j += 1;
+        }
+    }
+    mut adj = Adjacency { offsets: u64[0], clusters: u64[], shared: u64[] };
+    mut slots = u64[];
+    for i in cluster_count {
+        slots.push(18446744073709551615);
+    }
+    for i in cluster_count {
+        base := adj.clusters.len();
+        mut count: u64 = 0;
+        mut j = offsets[i];
+        while j < offsets[i + 1] {
+            v := data[j];
+            mut k = refc[v];
+            while k < refc[v + 1] {
+                c := refs[k];
+                k += 1;
+                if c == i {
+                    continue;
+                }
+                slot := slots[c];
+                if (slot < count) && (adj.clusters[base + slot] == c) {
+                    adj.shared[base + slot] = adj.shared[base + slot] + 1;
+                } else {
+                    slots[c] = count;
+                    adj.clusters.push(c);
+                    adj.shared.push(1);
+                    count += 1;
+                }
+            }
+            j += 1;
+        }
+        adj.offsets.push(base + count);
+    }
+    // groups
+    use_bounds := positions.len() != 0;
+    mut g = Groups { group: i64[], next: i64[], size: u64[], vertices: u64[], cx: f32[], cy: f32[], cz: f32[], radius: f32[] };
+    mut hids = u64[];
+    mut hord = i64[];
+    for i in cluster_count {
+        g.group.push(i64(i));
+        g.next.push(-1);
+        g.size.push(1);
+        nv := offsets[i + 1] - offsets[i];
+        g.vertices.push(nv);
+        mut c = f32[0.0, 0.0, 0.0];
+        mut r: f32 = 0.0;
+        if use_bounds {
+            for j in nv {
+                p := data[offsets[i] + j] * stride;
+                c[0] = c[0] + positions[p];
+                c[1] = c[1] + positions[p + 1];
+                c[2] = c[2] + positions[p + 2];
+            }
+            if nv != 0 {
+                n: f32 := f32(i64(nv));
+                c[0] = c[0] / n;
+                c[1] = c[1] / n;
+                c[2] = c[2] / n;
+            }
+            mut rsq: f32 = 0.0;
+            for j in nv {
+                p := data[offsets[i] + j] * stride;
+                ex := positions[p] - c[0];
+                ey := positions[p + 1] - c[1];
+                ez := positions[p + 2] - c[2];
+                d2: f32 := ex * ex + ey * ey + ez * ez;
+                if rsq < d2 {
+                    rsq = d2;
+                }
+            }
+            r = rsq.sqrt();
+        }
+        g.cx.push(c[0]);
+        g.cy.push(c[1]);
+        g.cz.push(c[2]);
+        g.radius.push(r);
+        heap_push(&mut hids, &mut hord, i, i64(nv));
+    }
+    mut acc = u64[];
+    for i in cluster_count {
+        acc.push(0);
+    }
+    while hids.len() != 0 {
+        top := heap_pop(&mut hids, &mut hord);
+        if g.size[top] == 0 {
+            continue;
+        }
+        mut ci = i64(top);
+        while ci >= 0 {
+            g.group[u64(ci)] = -1;
+            ci = g.next[u64(ci)];
+        }
+        if g.size[top] >= target {
+            continue;
+        }
+        pick := pick_group(&g, top, &adj, max_size, use_bounds, &mut acc);
+        if pick[0] == 0 {
+            continue;
+        }
+        best := pick[0] - 1;
+        best_shared := pick[1];
+        t := tail_of(&g, top);
+        g.next[t] = i64(best);
+        g.size[top] = g.size[top] + g.size[best];
+        g.vertices[top] = g.vertices[top] + g.vertices[best];
+        if g.vertices[top] > best_shared {
+            g.vertices[top] = g.vertices[top] - best_shared;
+        } else {
+            g.vertices[top] = 1;
+        }
+        g.size[best] = 0;
+        g.vertices[best] = 0;
+        if use_bounds {
+            merge_bounds(&mut g, top, best);
+            g.radius[best] = 0.0;
+        }
+        ci = i64(top);
+        while ci >= 0 {
+            g.group[u64(ci)] = i64(top);
+            ci = g.next[u64(ci)];
+        }
+        heap_push(&mut hids, &mut hord, top, i64(g.vertices[top]));
+    }
+    if use_bounds {
+        mut order = u64[];
+        for i in cluster_count {
+            if g.size[i] != 0 {
+                order.push(i);
+            }
+        }
+        sizes := u64[target, max_size];
+        n := order.len();
+        merge_spatial(&mut g, &mut order, 0, n, &sizes, 0);
+    }
+    mut out = u64[];
+    for i in cluster_count {
+        out.push(0);
+    }
+    mut next_group: u64 = 0;
+    for i in cluster_count {
+        if g.size[i] == 0 {
+            continue;
+        }
+        mut j = i64(i);
+        while j >= 0 {
+            out[u64(j)] = next_group;
+            j = g.next[u64(j)];
+        }
+        next_group += 1;
+    }
+    out.push(next_group);
+    return out;
+}
