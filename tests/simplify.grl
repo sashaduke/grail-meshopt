@@ -100,13 +100,13 @@ fn main() -> u64 {
         checks += 1;
         withattr := number(&f[1]);
         options := number(&f[2]);
-        targets := f32[f32_from_bits(number(&f[3])), f32_from_bits(number(&f[4]))];
+        target_index_count := u64(i64(f32_from_bits(number(&f[3]))));
         n := number(&f[5]);
         mut weights = f32[];
         if withattr != 0 {
             weights = f32[0.5, 0.0, 2.0];
         }
-        got := meshopt::simplify(&idx, &pos, count, 4, &attrs, 3, &weights, &lock, &targets, options);
+        got := meshopt::simplify(&idx, &pos, count, 4, &attrs, 3, &weights, &lock, target_index_count, f32_from_bits(number(&f[4])), options);
         mut ok = true;
         match got {
             Some(r) => {

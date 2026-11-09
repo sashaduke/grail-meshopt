@@ -571,23 +571,13 @@ fn compute_area<a>(s: (&a Bvh), k: u64, base: u64, count: u64) -> f32[] {
     return left;
 }
 
-// bvhPivot; returns (split, cost bits) packed as [split, f32_bits(cost)].
-struct PivotArgs {
-    count: u64,
-    step: u64,
-    min: u64,
-    max: u64,
-    fill: f32,
-    maxfill: u64
+// bvhPivot: the best split position along one axis and its cost.
+struct Pivot {
+    split: u64,
+    cost: f32
 }
 
-fn pivot<a, b>(areas: (&a f32[]), vertices: (&b u64[]), args: (&a PivotArgs)) -> u64[] {
-    count := args.count;
-    step := args.step;
-    min := args.min;
-    max := args.max;
-    fill := args.fill;
-    maxfill := args.maxfill;
+fn pivot<a, b>(areas: (&a f32[]), vertices: (&b u64[]), count: u64, step: u64, min: u64, max: u64, fill: f32, maxfill: u64) -> Pivot {
     aligned := (count >= min * 2) && divisible(count, min, max);
     mut end = count - 1;
     if aligned {
@@ -627,7 +617,7 @@ fn pivot<a, b>(areas: (&a f32[]), vertices: (&b u64[]), args: (&a PivotArgs)) ->
         }
         i += step;
     }
-    return u64[bestsplit, f32_bits(bestcost)];
+    return Pivot { split: bestsplit, cost: bestcost };
 }
 
 fn bvh_split<a>(s: (&a mut Bvh), base: u64, count: u64, depth: u64) -> unit {
@@ -657,13 +647,11 @@ fn bvh_split<a>(s: (&a mut Bvh), base: u64, count: u64, depth: u64) -> unit {
         if count <= s.max_triangles {
             count_vertices(&mut s, k, base, count, &mut vertices, true);
         }
-        pa := PivotArgs { count: count, step: step, min: mint, max: s.max_triangles, fill: s.fill_weight, maxfill: maxfill };
-        r := pivot(&areas, &vertices, &pa);
-        axiscost := f32_from_bits(r[1]);
-        if (r[0] != 0) && (axiscost < bestcost) {
+        r := pivot(&areas, &vertices, count, step, mint, s.max_triangles, s.fill_weight, maxfill);
+        if (r.split != 0) && (r.cost < bestcost) {
             bestk = k;
-            bestcost = axiscost;
-            bestsplit = r[0];
+            bestcost = r.cost;
+            bestsplit = r.split;
         }
     }
     if (bestk == 3) || (50 <= depth) {
@@ -749,12 +737,10 @@ fn radix_order<a>(keys: (&a f32[]), n: u64) -> u64[] {
     return order;
 }
 
-fn append_meshlet<a, b, c>(m: (&a mut Meshlet), tri: (&b u64[]), out: (&c mut Meshlets), used: (&c mut i64[]), limits: (&b u64[]), split: bool) -> bool {
+fn append_meshlet<a, b, c>(m: (&a mut Meshlet), tri: (&b u64[]), out: (&c mut Meshlets), used: (&c mut i64[]), max_vertices: u64, max_triangles: u64, split: bool) -> bool {
     a := tri[0];
     b := tri[1];
     c := tri[2];
-    max_vertices := limits[0];
-    max_triangles := limits[1];
     mut extra: u64 = 0;
     if used[a] < 0 {
         extra += 1;
@@ -791,10 +777,7 @@ fn append_meshlet<a, b, c>(m: (&a mut Meshlet), tri: (&b u64[]), out: (&c mut Me
     return result;
 }
 
-pub fn build_meshlets_spatial<a, b>(indices: (&a u64[]), positions: (&b f32[]), vertex_count: u64, stride: u64, limits: (&a u64[]), fill_weight: f32) -> Meshlets {
-    max_vertices := limits[0];
-    min_triangles := limits[1];
-    max_triangles := limits[2];
+pub fn build_meshlets_spatial<a, b>(indices: (&a u64[]), positions: (&b f32[]), vertex_count: u64, stride: u64, max_vertices: u64, min_triangles: u64, max_triangles: u64, fill_weight: f32) -> Meshlets {
     mut result = Meshlets { meshlets: Meshlet[], vertices: u64[], triangles: u8[] };
     index_count := indices.len();
     if index_count == 0 {
@@ -870,7 +853,6 @@ pub fn build_meshlets_spatial<a, b>(indices: (&a u64[]), positions: (&b f32[]), 
     bound := build_meshlets_bound(index_count, max_vertices, min_triangles);
     mut m = Meshlet { vertex_offset: 0, triangle_offset: 0, vertex_count: 0, triangle_count: 0 };
     mut pending = meshlet_count;
-    alimits := u64[max_vertices, max_triangles];
     for i in fc {
         mut split = (i > 0) && (s.boundary[i] == 1);
         if split && (meshlet_count > bound) && (result.meshlets.len() + pending >= bound) {
@@ -878,7 +860,7 @@ pub fn build_meshlets_spatial<a, b>(indices: (&a u64[]), positions: (&b f32[]), 
         }
         f := s.axes[i];
         tri := u64[indices[f * 3], indices[f * 3 + 1], indices[f * 3 + 2]];
-        append_meshlet(&mut m, &tri, &mut result, &mut s.used, &alimits, split);
+        append_meshlet(&mut m, &tri, &mut result, &mut s.used, max_vertices, max_triangles, split);
         pending -= s.boundary[i];
     }
     if m.triangle_count != 0 {
@@ -1490,10 +1472,8 @@ pub fn spatial_sort_remap<a>(positions: (&a f32[]), n: u64, stride: u64) -> u64[
     return out;
 }
 
-// axes holds the three sorted orders back to back (n entries each); limits = [n, cluster].
-fn split_points<a, b, c>(dest: (&a mut u64[]), axes: (&b mut u64[]), keys: (&c u64[]), base: u64, count: u64, limits: (&c u64[])) -> unit {
-    n := limits[0];
-    cluster := limits[1];
+// axes holds the three sorted orders back to back (n entries each).
+fn split_points<a, b, c>(dest: (&a mut u64[]), axes: (&b mut u64[]), keys: (&c u64[]), base: u64, count: u64, n: u64, cluster: u64) -> unit {
     if count <= cluster {
         for i in count {
             dest.push(axes[base + i]);
@@ -1547,8 +1527,8 @@ fn split_points<a, b, c>(dest: (&a mut u64[]), axes: (&b mut u64[]), keys: (&c u
             axes[k * n + base + split + i] = right[i];
         }
     }
-    split_points(&mut dest, &mut axes, &keys, base, split, &limits);
-    split_points(&mut dest, &mut axes, &keys, base + split, count - split, &limits);
+    split_points(&mut dest, &mut axes, &keys, base, split, n, cluster);
+    split_points(&mut dest, &mut axes, &keys, base + split, count - split, n, cluster);
     return ();
 }
 
@@ -1578,8 +1558,7 @@ pub fn spatial_cluster_points<a>(positions: (&a f32[]), n: u64, stride: u64, clu
         }
     }
     mut dest = u64[];
-    limits := u64[n, cluster];
-    split_points(&mut dest, &mut axes, &keys, 0, n, &limits);
+    split_points(&mut dest, &mut axes, &keys, 0, n, n, cluster);
     return dest;
 }
 
@@ -2473,12 +2452,10 @@ pub struct Simplified {
 
 // meshopt_simplifyWithAttributes (and meshopt_simplify with no attributes). Prune and the
 // internal solve/debug flags are not supported (None).
-pub fn simplify<a, b, c>(indices: (&a u64[]), positions: (&b f32[]), vertex_count: u64, stride: u64, attrs: (&c f32[]), astride: u64, weights: (&c f32[]), lock: (&a u8[]), targets: (&c f32[]), options: u64) -> Simplified? {
+pub fn simplify<a, b, c>(indices: (&a u64[]), positions: (&b f32[]), vertex_count: u64, stride: u64, attrs: (&c f32[]), astride: u64, weights: (&c f32[]), lock: (&a u8[]), target_index_count: u64, target_error: f32, options: u64) -> Simplified? {
     if (options & SIMPLIFY_PRUNE) != 0 {
         return None;
     }
-    target_index_count := u64(i64(targets[0]));
-    target_error := targets[1];
     p := simplify_prepare(&indices, &positions, vertex_count, stride, &lock, options);
     mut st = fill_quadrics(&p, &positions, stride, &attrs, astride, &weights, &lock, options);
     n := p.vertex_count;

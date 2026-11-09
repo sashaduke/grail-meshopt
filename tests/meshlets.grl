@@ -85,9 +85,8 @@ fn main() -> u64 {
         checks += 1;
         mut ok = true;
         if same(&tag, "meshlets") {
-            limits := u64[number(&f[1]), number(&f[2]), number(&f[3])];
             fill := f32_from_bits(number(&f[4]));
-            got = meshopt::build_meshlets_spatial(&idx, &pos, count, 4, &limits, fill);
+            got = meshopt::build_meshlets_spatial(&idx, &pos, count, 4, number(&f[1]), number(&f[2]), number(&f[3]), fill);
             n := number(&f[5]);
             if got.meshlets.len() != n {
                 ok = false;
