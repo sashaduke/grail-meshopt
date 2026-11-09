@@ -19,7 +19,10 @@ Ported so far:
 - `partition_clusters` (meshopt_partitionClusters, with or without positions; the partition count
   is appended as the last element)
 
-In progress: meshlet optimisation and the simplifier, which together
+- `simplify_prepare`: the simplifier front end (sparse remap, edge adjacency, position remap with
+  wedge rings, vertex classification and edge loops)
+
+In progress: the simplifier collapse loop and meshlet optimisation, which together
 with the above back Abundance's cluster LOD builder.
 
 ## Use

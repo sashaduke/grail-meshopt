@@ -1598,3 +1598,361 @@ pub fn spatial_cluster_points<a>(positions: (&a f32[]), n: u64, stride: u64, clu
     split_points(&mut dest, &mut axes, &keys, 0, n, &limits);
     return dest;
 }
+
+// ---- simplifier front end (simplifier.cpp: sparse remap, edge adjacency, position remap with
+// wedge rings, vertex classification) ----
+
+pub const SIMPLIFY_LOCK_BORDER: u64 = 1;
+pub const SIMPLIFY_SPARSE: u64 = 2;
+pub const SIMPLIFY_ERROR_ABSOLUTE: u64 = 4;
+pub const SIMPLIFY_PRUNE: u64 = 8;
+pub const SIMPLIFY_REGULARIZE: u64 = 16;
+pub const SIMPLIFY_PERMISSIVE: u64 = 32;
+pub const SIMPLIFY_REGULARIZE_LIGHT: u64 = 64;
+pub const SIMPLIFY_PRESERVE_FOLDS: u64 = 128;
+pub const SIMPLIFY_ERROR_CLAMPED: u64 = 256;
+pub const VERTEX_LOCK: u64 = 1;
+pub const VERTEX_PROTECT: u64 = 2;
+pub const VERTEX_PRIORITY: u64 = 4;
+
+pub const KIND_MANIFOLD: u64 = 0;
+pub const KIND_BORDER: u64 = 1;
+pub const KIND_SEAM: u64 = 2;
+pub const KIND_COMPLEX: u64 = 3;
+pub const KIND_FRINGE: u64 = 4;
+pub const KIND_LOCKED: u64 = 5;
+
+const NONE32: u64 = 4294967295;
+
+// Half-edges per vertex: for vertex v, entries offsets[v]..offsets[v+1] of next/prev.
+pub struct Adjacency3 {
+    offsets: u64[],
+    next: u64[],
+    prev: u64[]
+}
+
+pub struct Prepared {
+    // Compact index buffer (sparse indices when SIMPLIFY_SPARSE) and its vertex count.
+    indices: u64[],
+    vertex_count: u64,
+    // Original vertex of each compact vertex (empty without SIMPLIFY_SPARSE).
+    sparse_remap: u64[],
+    adjacency: Adjacency3,
+    remap: u64[],
+    wedge: u64[],
+    kind: u64[],
+    loop: u64[],
+    loopback: u64[]
+}
+
+fn sparse_remap_indices<a>(indices: (&a mut u64[])) -> u64[] {
+    mut seen = [u64: u64]();
+    mut remap = u64[];
+    for i in indices.len() {
+        index := indices[i];
+        mut hit: u64 = NONE32;
+        match seen.get(&index) {
+            Some(v) => { hit = load(v); },
+            None => { }
+        }
+        if hit == NONE32 {
+            hit = remap.len();
+            seen.insert(index, hit);
+            remap.push(index);
+        }
+        indices[i] = hit;
+    }
+    return remap;
+}
+
+pub fn update_adjacency<a, b>(adj: (&a mut Adjacency3), indices: (&b u64[]), index_count: u64, vertex_count: u64, remap: (&b u64[])) -> unit {
+    mut counts = u64[];
+    for i in vertex_count {
+        counts.push(0);
+    }
+    for i in index_count {
+        mut v = indices[i];
+        if remap.len() != 0 {
+            v = remap[v];
+        }
+        counts[v] = counts[v] + 1;
+    }
+    mut offsets = u64[0];
+    mut fill = u64[];
+    mut offset: u64 = 0;
+    for i in vertex_count {
+        fill.push(offset);
+        offset += counts[i];
+        offsets.push(offset);
+    }
+    mut next = u64[];
+    mut prev = u64[];
+    for i in index_count {
+        next.push(0);
+        prev.push(0);
+    }
+    for f in index_count / 3 {
+        mut a = indices[f * 3];
+        mut b = indices[f * 3 + 1];
+        mut c = indices[f * 3 + 2];
+        if remap.len() != 0 {
+            a = remap[a];
+            b = remap[b];
+            c = remap[c];
+        }
+        next[fill[a]] = b;
+        prev[fill[a]] = c;
+        fill[a] = fill[a] + 1;
+        next[fill[b]] = c;
+        prev[fill[b]] = a;
+        fill[b] = fill[b] + 1;
+        next[fill[c]] = a;
+        prev[fill[c]] = b;
+        fill[c] = fill[c] + 1;
+    }
+    adj.offsets = offsets;
+    adj.next = next;
+    adj.prev = prev;
+    return ();
+}
+
+fn has_edge<a>(adj: (&a Adjacency3), a: u64, b: u64) -> bool {
+    mut k = adj.offsets[a];
+    while k < adj.offsets[a + 1] {
+        if adj.next[k] == b {
+            return true;
+        }
+        k += 1;
+    }
+    return false;
+}
+
+fn has_edge_wedge<a, b>(adj: (&a Adjacency3), a: u64, b: u64, remap: (&b u64[]), wedge: (&b u64[])) -> bool {
+    mut v = a;
+    while true {
+        mut k = adj.offsets[v];
+        while k < adj.offsets[v + 1] {
+            if remap[adj.next[k]] == remap[b] {
+                return true;
+            }
+            k += 1;
+        }
+        v = wedge[v];
+        if v == a {
+            break;
+        }
+    }
+    return false;
+}
+
+// Simplifier position remap: positions compared as floats (-0 == +0, NaN unequal), through the
+// sparse remap when present; wedge links all vertices sharing a position in a ring.
+fn position_rings<a, b>(positions: (&a f32[]), stride: u64, vertex_count: u64, sparse: (&b u64[])) -> u64[][] {
+    mut first = [u8[]: u64]();
+    mut remap = u64[];
+    for i in vertex_count {
+        mut ri = i;
+        if sparse.len() != 0 {
+            ri = sparse[i];
+        }
+        match position_key(&positions, ri * stride) {
+            Some(key) => {
+                mut hit: u64 = NONE32;
+                match first.get(&key) {
+                    Some(j) => { hit = load(j); },
+                    None => { }
+                }
+                if hit == NONE32 {
+                    first.insert(key, i);
+                    remap.push(i);
+                } else {
+                    remap.push(hit);
+                }
+            },
+            None => { remap.push(i); }
+        }
+    }
+    mut wedge = u64[];
+    for i in vertex_count {
+        wedge.push(i);
+    }
+    for i in vertex_count {
+        if remap[i] != i {
+            r := remap[i];
+            wedge[i] = wedge[r];
+            wedge[r] = i;
+        }
+    }
+    mut out = u64[][];
+    out.push(remap);
+    out.push(wedge);
+    return out;
+}
+
+fn classify<a>(p: (&a mut Prepared), lock: (&a u8[]), options: u64) -> unit {
+    n := p.vertex_count;
+    mut openinc = u64[];
+    mut openout = u64[];
+    for i in n {
+        openinc.push(NONE32);
+        openout.push(NONE32);
+    }
+    for vertex in n {
+        mut k = p.adjacency.offsets[vertex];
+        while k < p.adjacency.offsets[vertex + 1] {
+            target := p.adjacency.next[k];
+            k += 1;
+            if target == vertex {
+                openinc[vertex] = vertex;
+                openout[vertex] = vertex;
+            } else {
+                if has_edge(&p.adjacency, target, vertex) == false {
+                    if openinc[target] == NONE32 {
+                        openinc[target] = vertex;
+                    } else {
+                        openinc[target] = target;
+                    }
+                    if openout[vertex] == NONE32 {
+                        openout[vertex] = target;
+                    } else {
+                        openout[vertex] = vertex;
+                    }
+                }
+            }
+        }
+    }
+    mut kind = u64[];
+    for i in n {
+        kind.push(KIND_LOCKED);
+    }
+    for i in n {
+        if p.remap[i] == i {
+            if p.wedge[i] == i {
+                oi := openinc[i];
+                oo := openout[i];
+                if (oi == NONE32) && (oo == NONE32) {
+                    kind[i] = KIND_MANIFOLD;
+                } else {
+                    if (oi != NONE32) && (oo != NONE32) && (p.remap[oi] == p.remap[oo]) && (oi != i) {
+                        kind[i] = KIND_SEAM;
+                    } else {
+                        if (oi != i) && (oo != i) {
+                            kind[i] = KIND_BORDER;
+                        } else {
+                            kind[i] = KIND_LOCKED;
+                        }
+                    }
+                }
+            } else {
+                if p.wedge[p.wedge[i]] == i {
+                    w := p.wedge[i];
+                    iv := openinc[i];
+                    ov := openout[i];
+                    iw := openinc[w];
+                    ow := openout[w];
+                    if (iv != NONE32) && (iv != i) && (ov != NONE32) && (ov != i) && (iw != NONE32) && (iw != w) && (ow != NONE32) && (ow != w) && (p.remap[iv] == p.remap[ow]) && (p.remap[ov] == p.remap[iw]) && (p.remap[iv] != p.remap[ov]) {
+                        kind[i] = KIND_SEAM;
+                    } else {
+                        kind[i] = KIND_LOCKED;
+                    }
+                } else {
+                    kind[i] = KIND_LOCKED;
+                }
+            }
+        } else {
+            kind[i] = kind[p.remap[i]];
+        }
+    }
+    if (options & SIMPLIFY_PERMISSIVE) != 0 {
+        for i in n {
+            if (kind[i] == KIND_SEAM) || (kind[i] == KIND_LOCKED) {
+                if p.remap[i] != i {
+                    kind[i] = kind[p.remap[i]];
+                    continue;
+                }
+                mut protect = false;
+                mut v = i;
+                while true {
+                    mut rv = v;
+                    if p.sparse_remap.len() != 0 {
+                        rv = p.sparse_remap[v];
+                    }
+                    if (lock.len() != 0) && ((lock[rv] & VERTEX_PROTECT) != 0) {
+                        protect = true;
+                    }
+                    v = p.wedge[v];
+                    if v == i {
+                        break;
+                    }
+                }
+                mut border = false;
+                while true {
+                    mut k = p.adjacency.offsets[v];
+                    while k < p.adjacency.offsets[v + 1] {
+                        if has_edge_wedge(&p.adjacency, p.adjacency.next[k], v, &p.remap, &p.wedge) == false {
+                            border = true;
+                        }
+                        k += 1;
+                    }
+                    v = p.wedge[v];
+                    if v == i {
+                        break;
+                    }
+                }
+                if protect == false {
+                    if border {
+                        kind[i] = KIND_FRINGE;
+                    } else {
+                        kind[i] = KIND_COMPLEX;
+                    }
+                }
+            }
+        }
+    }
+    if lock.len() != 0 {
+        for i in n {
+            mut ri = i;
+            if p.sparse_remap.len() != 0 {
+                ri = p.sparse_remap[i];
+            }
+            if (lock[ri] & VERTEX_LOCK) != 0 {
+                kind[p.remap[i]] = KIND_LOCKED;
+            }
+        }
+        for i in n {
+            if kind[p.remap[i]] == KIND_LOCKED {
+                kind[i] = KIND_LOCKED;
+            }
+        }
+    }
+    if (options & SIMPLIFY_LOCK_BORDER) != 0 {
+        for i in n {
+            if (kind[i] == KIND_BORDER) || (kind[i] == KIND_FRINGE) {
+                kind[i] = KIND_LOCKED;
+            }
+        }
+    }
+    p.kind = kind;
+    p.loop = openout;
+    p.loopback = openinc;
+    return ();
+}
+
+// The simplifier's preparation: what meshopt_simplify computes before its first collapse pass.
+// `lock` is the per-vertex lock mask (empty for none).
+pub fn simplify_prepare<a, b>(indices: (&a u64[]), positions: (&b f32[]), vertex_count: u64, stride: u64, lock: (&a u8[]), options: u64) -> Prepared {
+    mut idx = indices.copy();
+    mut sparse = u64[];
+    mut n = vertex_count;
+    if (options & SIMPLIFY_SPARSE) != 0 {
+        sparse = sparse_remap_indices(&mut idx);
+        n = sparse.len();
+    }
+    mut adj = Adjacency3 { offsets: u64[], next: u64[], prev: u64[] };
+    none := u64[];
+    update_adjacency(&mut adj, &idx, idx.len(), n, &none);
+    rings := position_rings(&positions, stride, n, &sparse);
+    mut p = Prepared { indices: idx, vertex_count: n, sparse_remap: sparse, adjacency: adj, remap: rings[0].copy(), wedge: rings[1].copy(), kind: u64[], loop: u64[], loopback: u64[] };
+    classify(&mut p, &lock, options);
+    return p;
+}

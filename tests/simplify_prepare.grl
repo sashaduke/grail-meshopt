@@ -1,0 +1,130 @@
+use meshopt;
+use collections;
+use fs;
+use io;
+
+// Checks the simplifier front end (simplify_prepare: sparse remap, position remap and wedge rings,
+// vertex kinds, edge loops) against meshoptimizer's internals (tests/reference/simplify_prepare.cpp
+// -> tests/simplify_prepare_expected.txt). Returns the number of failures.
+
+fn read_all<a>(path: &a [u8]) -> u8[] {
+    match fs::read(path) {
+        d: u8[] => { return d; },
+        e: io::Error => { println("cannot read tests/simplify_prepare_expected.txt"); return u8[]; }
+    }
+}
+fn number<a>(text: &a [u8]) -> u64 {
+    mut v: u64 = 0;
+    mut neg = false;
+    for i in text.len() {
+        if text[i] == 45 {
+            neg = true;
+        } else {
+            v = v * 10 + (text[i] - 48);
+        }
+    }
+    return v;
+}
+fn signed<a>(text: &a [u8]) -> i64 {
+    if text[0] == 45 {
+        return 0 - i64(number(&text[1: text.len()]));
+    }
+    return i64(number(&text));
+}
+fn same<a, b>(x: &a [u8], y: &b [u8]) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    for i in x.len() {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+fn check_run<a, b>(name: string, got: (&a u64[]), f: (&b u8[][]), at: u64, n: u64) -> bool {
+    if got.len() != n {
+        println("FAIL {}: length {} want {}", name, got.len(), n);
+        return false;
+    }
+    for i in n {
+        if got[i] != number(&f[at + i]) {
+            println("FAIL {}[{}]: {} want {}", name, i, got[i], number(&f[at + i]));
+            return false;
+        }
+    }
+    return true;
+}
+
+fn main() -> u64 {
+    text := read_all("tests/simplify_prepare_expected.txt");
+    mut failures: u64 = 0;
+    mut checks: u64 = 0;
+    mut pos = f32[];
+    mut count: u64 = 0;
+    mut idx = u64[];
+    mut lock = u8[];
+    mut start: u64 = 0;
+    for i in text.len() {
+        if text[i] != 10 {
+            continue;
+        }
+        mut f = u8[][];
+        mut s = start;
+        while s < i {
+            mut e = s;
+            while (e < i) && (text[e] != 32) {
+                e += 1;
+            }
+            f.push(text[s: e].copy());
+            s = e + 1;
+        }
+        start = i + 1;
+        tag := f[0].copy();
+        if same(&tag, "pos") {
+            count = number(&f[1]);
+            pos = f32[];
+            for k in count * 4 {
+                pos.push(f32_from_bits(number(&f[k + 2])));
+            }
+            continue;
+        }
+        if same(&tag, "idx") {
+            idx = u64[];
+            for k in number(&f[1]) {
+                idx.push(number(&f[k + 2]));
+            }
+            continue;
+        }
+        if same(&tag, "lock") {
+            lock = u8[];
+            for k in number(&f[1]) {
+                lock.push(number(&f[k + 2]));
+            }
+            continue;
+        }
+        checks += 1;
+        options := number(&f[1]);
+        n := number(&f[2]);
+        p := meshopt::simplify_prepare(&idx, &pos, count, 4, &lock, options);
+        mut sparse = p.sparse_remap.copy();
+        if sparse.len() == 0 {
+            for k in p.vertex_count {
+                sparse.push(k);
+            }
+        }
+        mut ok = p.vertex_count == n;
+        ok = ok && check_run("sparse", &sparse, &f, 3, n);
+        ok = ok && check_run("remap", &p.remap, &f, 3 + n, n);
+        ok = ok && check_run("wedge", &p.wedge, &f, 3 + n * 2, n);
+        ok = ok && check_run("kind", &p.kind, &f, 3 + n * 3, n);
+        ok = ok && check_run("loop", &p.loop, &f, 3 + n * 4, n);
+        ok = ok && check_run("loopback", &p.loopback, &f, 3 + n * 5, n);
+        if ok == false {
+            println("FAIL prep options={} (check {})", options, checks);
+            failures += 1;
+        }
+    }
+    println("{} checks, {} failures", checks, failures);
+    return failures;
+}
