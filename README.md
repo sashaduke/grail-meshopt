@@ -20,7 +20,8 @@ Ported so far:
   is appended as the last element)
 
 - `simplify_prepare`: the simplifier front end (sparse remap, edge adjacency, position remap with
-  wedge rings, vertex classification and edge loops)
+  wedge rings, vertex classification and edge loops) and `fill_quadrics` (face, vertex, edge, fold
+  and attribute quadrics)
 
 In progress: the simplifier collapse loop and meshlet optimisation, which together
 with the above back Abundance's cluster LOD builder.

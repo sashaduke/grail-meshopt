@@ -1956,3 +1956,428 @@ pub fn simplify_prepare<a, b>(indices: (&a u64[]), positions: (&b f32[]), vertex
     classify(&mut p, &lock, options);
     return p;
 }
+
+// ---- simplifier quadrics (Quadric: a00 a11 a22 a10 a20 a21 b0 b1 b2 c w, 11 floats per entry;
+// QuadricGrad: gx gy gz gw, 4 floats) ----
+
+const QN: u64 = 11;
+
+fn fzero(n: u64) -> f32[] {
+    mut v = f32[];
+    for i in n {
+        v.push(0.0);
+    }
+    return v;
+}
+
+// rescalePositions: positions (3 floats per vertex, through the sparse remap) scaled into the
+// unit cube; returns [extent, minx, miny, minz] followed by the 3n scaled coordinates.
+pub fn rescale_positions<a, b>(positions: (&a f32[]), stride: u64, n: u64, sparse: (&b u64[])) -> f32[] {
+    big := flt_max();
+    mut minv = f32[big, big, big];
+    mut maxv = f32[0.0 - big, 0.0 - big, 0.0 - big];
+    mut out = f32[0.0, 0.0, 0.0, 0.0];
+    for i in n {
+        mut ri = i;
+        if sparse.len() != 0 {
+            ri = sparse[i];
+        }
+        for j in 3 {
+            vj := positions[ri * stride + j];
+            out.push(vj);
+            if minv[j] > vj {
+                minv[j] = vj;
+            }
+            if maxv[j] < vj {
+                maxv[j] = vj;
+            }
+        }
+    }
+    mut extent: f32 = 0.0;
+    for j in 3 {
+        d := maxv[j] - minv[j];
+        if (d < extent) == false {
+            extent = d;
+        }
+    }
+    mut scale: f32 = 0.0;
+    if extent != 0.0 {
+        one: f32 := 1.0;
+        scale = one / extent;
+    }
+    for i in n {
+        for j in 3 {
+            out[4 + i * 3 + j] = (out[4 + i * 3 + j] - minv[j]) * scale;
+        }
+    }
+    out[0] = extent;
+    out[1] = minv[0];
+    out[2] = minv[1];
+    out[3] = minv[2];
+    return out;
+}
+
+fn qadd<a, b>(dst: (&a mut f32[]), at: u64, src: (&b f32[]), from: u64) -> unit {
+    for k in QN {
+        dst[at + k] = dst[at + k] + src[from + k];
+    }
+    return ();
+}
+
+fn from_plane(a: f32, b: f32, c: f32, d: f32, w: f32) -> f32[] {
+    aw := a * w;
+    bw := b * w;
+    cw := c * w;
+    dw := d * w;
+    return f32[a * aw, b * bw, c * cw, a * bw, a * cw, b * cw, a * dw, b * dw, c * dw, d * dw, w];
+}
+
+fn from_point(x: f32, y: f32, z: f32, w: f32) -> f32[] {
+    sq: f32 := x * x + y * y + z * z;
+    return f32[w, w, w, 0.0, 0.0, 0.0, (0.0 - x) * w, (0.0 - y) * w, (0.0 - z) * w, sq * w, w];
+}
+
+// normalize() of a 3-vector held at v[0..3]; returns the length.
+fn normalize3<a>(v: (&a mut f32[])) -> f32 {
+    sq: f32 := v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    length: f32 := sq.sqrt();
+    if length > 0.0 {
+        v[0] = v[0] / length;
+        v[1] = v[1] / length;
+        v[2] = v[2] / length;
+    }
+    return length;
+}
+
+fn pt<a>(p: (&a f32[]), i: u64) -> f32[] {
+    return f32[p[i * 3], p[i * 3 + 1], p[i * 3 + 2]];
+}
+
+fn from_triangle<a>(p0: (&a f32[]), p1: (&a f32[]), p2: (&a f32[]), weight: f32) -> f32[] {
+    p10x := p1[0] - p0[0];
+    p10y := p1[1] - p0[1];
+    p10z := p1[2] - p0[2];
+    p20x := p2[0] - p0[0];
+    p20y := p2[1] - p0[1];
+    p20z := p2[2] - p0[2];
+    mut n = f32[p10y * p20z - p10z * p20y, p10z * p20x - p10x * p20z, p10x * p20y - p10y * p20x];
+    area := normalize3(&mut n);
+    distance: f32 := n[0] * p0[0] + n[1] * p0[1] + n[2] * p0[2];
+    w: f32 := area.sqrt() * weight;
+    return from_plane(n[0], n[1], n[2], 0.0 - distance, w);
+}
+
+fn from_triangle_edge<a>(p0: (&a f32[]), p1: (&a f32[]), p2: (&a f32[]), weight: f32) -> f32[] {
+    p10x := p1[0] - p0[0];
+    p10y := p1[1] - p0[1];
+    p10z := p1[2] - p0[2];
+    lengthsq: f32 := p10x * p10x + p10y * p10y + p10z * p10z;
+    length: f32 := lengthsq.sqrt();
+    p20x := p2[0] - p0[0];
+    p20y := p2[1] - p0[1];
+    p20z := p2[2] - p0[2];
+    p20p: f32 := p20x * p10x + p20y * p10y + p20z * p10z;
+    mut perp = f32[p20x * lengthsq - p10x * p20p, p20y * lengthsq - p10y * p20p, p20z * lengthsq - p10z * p20p];
+    normalize3(&mut perp);
+    distance: f32 := perp[0] * p0[0] + perp[1] * p0[1] + perp[2] * p0[2];
+    return from_plane(perp[0], perp[1], perp[2], 0.0 - distance, length * weight);
+}
+
+// quadricFromAttributes: the 11-float quadric followed by 4 floats per attribute (gradients).
+fn from_attributes<a, b>(p0: (&a f32[]), p1: (&a f32[]), p2: (&a f32[]), va: (&b f32[]), bases: (&b u64[]), count: u64) -> f32[] {
+    v0x := p1[0] - p0[0];
+    v0y := p1[1] - p0[1];
+    v0z := p1[2] - p0[2];
+    v1x := p2[0] - p0[0];
+    v1y := p2[1] - p0[1];
+    v1z := p2[2] - p0[2];
+    nx := v0y * v1z - v0z * v1y;
+    ny := v0z * v1x - v0x * v1z;
+    nz := v0x * v1y - v0y * v1x;
+    nsq: f32 := nx * nx + ny * ny + nz * nz;
+    half: f32 := 0.5;
+    w: f32 := nsq.sqrt() * half;
+    d00: f32 := v0x * v0x + v0y * v0y + v0z * v0z;
+    d01: f32 := v0x * v1x + v0y * v1y + v0z * v1z;
+    d11: f32 := v1x * v1x + v1y * v1y + v1z * v1z;
+    denom: f32 := d00 * d11 - d01 * d01;
+    mut denomr: f32 = 0.0;
+    if denom != 0.0 {
+        one: f32 := 1.0;
+        denomr = one / denom;
+    }
+    gx1: f32 := (d11 * v0x - d01 * v1x) * denomr;
+    gx2: f32 := (d00 * v1x - d01 * v0x) * denomr;
+    gy1: f32 := (d11 * v0y - d01 * v1y) * denomr;
+    gy2: f32 := (d00 * v1y - d01 * v0y) * denomr;
+    gz1: f32 := (d11 * v0z - d01 * v1z) * denomr;
+    gz2: f32 := (d00 * v1z - d01 * v0z) * denomr;
+    mut q = fzero(QN);
+    q[10] = w;
+    for k in count {
+        a0 := va[bases[0] + k];
+        a1 := va[bases[1] + k];
+        a2 := va[bases[2] + k];
+        gx: f32 := gx1 * (a1 - a0) + gx2 * (a2 - a0);
+        gy: f32 := gy1 * (a1 - a0) + gy2 * (a2 - a0);
+        gz: f32 := gz1 * (a1 - a0) + gz2 * (a2 - a0);
+        gw: f32 := a0 - p0[0] * gx - p0[1] * gy - p0[2] * gz;
+        q[0] = q[0] + w * (gx * gx);
+        q[1] = q[1] + w * (gy * gy);
+        q[2] = q[2] + w * (gz * gz);
+        q[3] = q[3] + w * (gy * gx);
+        q[4] = q[4] + w * (gz * gx);
+        q[5] = q[5] + w * (gz * gy);
+        q[6] = q[6] + w * (gx * gw);
+        q[7] = q[7] + w * (gy * gw);
+        q[8] = q[8] + w * (gz * gw);
+        q[9] = q[9] + w * (gw * gw);
+        q.push(w * gx);
+        q.push(w * gy);
+        q.push(w * gz);
+        q.push(w * gw);
+    }
+    return q;
+}
+
+pub fn quadric_eval<a>(q: (&a f32[]), at: u64, x: f32, y: f32, z: f32) -> f32 {
+    two: f32 := 2.0;
+    mut rx: f32 = (q[at + 6] + q[at + 3] * y) * two;
+    mut ry: f32 = (q[at + 7] + q[at + 5] * z) * two;
+    mut rz: f32 = (q[at + 8] + q[at + 4] * x) * two;
+    rx = rx + q[at] * x;
+    ry = ry + q[at + 1] * y;
+    rz = rz + q[at + 2] * z;
+    return q[at + 9] + rx * x + ry * y + rz * z;
+}
+
+// The quadric state after meshopt_simplify's fill passes: vertex quadrics, attribute quadrics and
+// gradients (empty without attributes), rescaled positions and attributes, and the scale.
+pub struct Quadrics {
+    vertex: f32[],
+    attribute: f32[],
+    gradients: f32[],
+    positions: f32[],
+    attributes: f32[],
+    attribute_count: u64,
+    scale: f32
+}
+
+fn opposite_vertex<a, b>(adj: (&a Adjacency3), a: u64, b: u64, remap: (&b u64[]), wedge: (&b u64[])) -> u64 {
+    mut v = a;
+    mut r: u64 = NONE32;
+    while true {
+        mut k = adj.offsets[v];
+        while k < adj.offsets[v + 1] {
+            if remap[adj.next[k]] == remap[b] {
+                if r == NONE32 {
+                    r = adj.prev[k];
+                } else {
+                    r = a;
+                }
+            }
+            k += 1;
+        }
+        v = wedge[v];
+        if v == a {
+            break;
+        }
+    }
+    if r == a {
+        return NONE32;
+    }
+    return r;
+}
+
+// attributes: `count` floats per original vertex at `astride` floats apart, weighted by `weights`
+// (zero weights are dropped, as meshoptimizer does).
+pub fn fill_quadrics<a, b, c>(p: (&a Prepared), positions: (&b f32[]), stride: u64, attrs: (&c f32[]), astride: u64, weights: (&c f32[]), lock: (&a u8[]), options: u64) -> Quadrics {
+    n := p.vertex_count;
+    rescaled := rescale_positions(&positions, stride, n, &p.sparse_remap);
+    mut pos = f32[];
+    for i in n * 3 {
+        pos.push(rescaled[4 + i]);
+    }
+    mut used = u64[];
+    for k in weights.len() {
+        if weights[k] > 0.0 {
+            used.push(k);
+        }
+    }
+    acount := used.len();
+    mut va = f32[];
+    for i in n {
+        mut ri = i;
+        if p.sparse_remap.len() != 0 {
+            ri = p.sparse_remap[i];
+        }
+        for k in acount {
+            rk := used[k];
+            va.push(attrs[ri * astride + rk] * weights[rk]);
+        }
+    }
+    mut vq = fzero(n * QN);
+    idx := &p.indices;
+    // fillFaceQuadrics
+    mut f: u64 = 0;
+    while f < idx.len() {
+        i0 := idx[f];
+        i1 := idx[f + 1];
+        i2 := idx[f + 2];
+        p0 := pt(&pos, i0);
+        p1 := pt(&pos, i1);
+        p2 := pt(&pos, i2);
+        one: f32 := 1.0;
+        q := from_triangle(&p0, &p1, &p2, one);
+        qadd(&mut vq, p.remap[i0] * QN, &q, 0);
+        qadd(&mut vq, p.remap[i1] * QN, &q, 0);
+        qadd(&mut vq, p.remap[i2] * QN, &q, 0);
+        f += 3;
+    }
+    // fillVertexQuadrics
+    mut factor: f32 = 0.0000001;
+    if (options & SIMPLIFY_REGULARIZE) != 0 {
+        factor = 0.1;
+    }
+    if (options & SIMPLIFY_REGULARIZE_LIGHT) != 0 {
+        factor = 0.01;
+    }
+    for i in n {
+        if p.remap[i] != i {
+            continue;
+        }
+        mut ri = i;
+        if p.sparse_remap.len() != 0 {
+            ri = p.sparse_remap[i];
+        }
+        priority := (lock.len() != 0) && ((lock[ri] & VERTEX_PRIORITY) != 0);
+        mut fw = factor;
+        if priority {
+            fw = 1.0;
+        }
+        w: f32 := vq[i * QN + 10] * fw;
+        q := from_point(pos[i * 3], pos[i * 3 + 1], pos[i * 3 + 2], w);
+        qadd(&mut vq, i * QN, &q, 0);
+    }
+    // fillEdgeQuadrics
+    nexte := u64[1, 2, 0, 1];
+    f = 0;
+    while f < idx.len() {
+        for e in 3 {
+            i0 := idx[f + e];
+            i1 := idx[f + nexte[e]];
+            k0 := p.kind[i0];
+            k1 := p.kind[i1];
+            if (k0 == KIND_MANIFOLD) || (k1 == KIND_MANIFOLD) {
+                continue;
+            }
+            b0 := (k0 == KIND_BORDER) || (k0 == KIND_SEAM) || (k0 == KIND_FRINGE);
+            b1 := (k1 == KIND_BORDER) || (k1 == KIND_SEAM) || (k1 == KIND_FRINGE);
+            if (b0 == false) && (b1 == false) {
+                continue;
+            }
+            if ((k0 == KIND_BORDER) || (k0 == KIND_SEAM)) && (p.loop[i0] != i1) {
+                continue;
+            }
+            if ((k1 == KIND_BORDER) || (k1 == KIND_SEAM)) && (p.loopback[i1] != i0) {
+                continue;
+            }
+            if ((k0 == KIND_FRINGE) || (k1 == KIND_FRINGE)) && ((k0 == KIND_COMPLEX) || (k1 == KIND_COMPLEX)) {
+                continue;
+            }
+            i2 := idx[f + nexte[e + 1]];
+            mut weight: f32 = 10.0;
+            if (k0 == KIND_SEAM) || (k1 == KIND_SEAM) {
+                weight = 0.5;
+            }
+            p0 := pt(&pos, i0);
+            p1 := pt(&pos, i1);
+            p2 := pt(&pos, i2);
+            mut q = from_triangle_edge(&p0, &p1, &p2, weight);
+            mut qt = from_triangle(&p0, &p1, &p2, weight);
+            qt[10] = 0.0;
+            qadd(&mut q, 0, &qt, 0);
+            qadd(&mut vq, p.remap[i0] * QN, &q, 0);
+            qadd(&mut vq, p.remap[i1] * QN, &q, 0);
+        }
+        f += 3;
+    }
+    // fillFoldQuadrics
+    if (options & SIMPLIFY_PRESERVE_FOLDS) != 0 {
+        for i0 in n {
+            mut k = p.adjacency.offsets[i0];
+            while k < p.adjacency.offsets[i0 + 1] {
+                i1 := p.adjacency.next[k];
+                i2 := p.adjacency.prev[k];
+                k += 1;
+                if p.remap[i1] > p.remap[i0] {
+                    continue;
+                }
+                i3 := opposite_vertex(&p.adjacency, i1, i0, &p.remap, &p.wedge);
+                if i3 == NONE32 {
+                    continue;
+                }
+                p0 := pt(&pos, i0);
+                p1 := pt(&pos, i1);
+                p2 := pt(&pos, i2);
+                p3 := pt(&pos, i3);
+                p10x := p1[0] - p0[0];
+                p10y := p1[1] - p0[1];
+                p10z := p1[2] - p0[2];
+                p20x := p2[0] - p0[0];
+                p20y := p2[1] - p0[1];
+                p20z := p2[2] - p0[2];
+                p30x := p3[0] - p0[0];
+                p30y := p3[1] - p0[1];
+                p30z := p3[2] - p0[2];
+                nx := p10y * p20z - p10z * p20y;
+                ny := p10z * p20x - p10x * p20z;
+                nz := p10x * p20y - p10y * p20x;
+                ox := p30y * p10z - p30z * p10y;
+                oy := p30z * p10x - p30x * p10z;
+                oz := p30x * p10y - p30y * p10x;
+                nsq: f32 := nx * nx + ny * ny + nz * nz;
+                osq: f32 := ox * ox + oy * oy + oz * oz;
+                nl: f32 := nsq.sqrt();
+                ol: f32 := osq.sqrt();
+                lim: f32 := -0.85;
+                dot: f32 := nx * ox + ny * oy + nz * oz;
+                if dot >= lim * nl * ol {
+                    continue;
+                }
+                one: f32 := 1.0;
+                mut q = from_triangle_edge(&p0, &p1, &p2, one);
+                qo := from_triangle_edge(&p0, &p1, &p3, one);
+                qadd(&mut q, 0, &qo, 0);
+                qadd(&mut vq, p.remap[i0] * QN, &q, 0);
+                qadd(&mut vq, p.remap[i1] * QN, &q, 0);
+            }
+        }
+    }
+    // fillAttributeQuadrics
+    mut aq = f32[];
+    mut ag = f32[];
+    if acount != 0 {
+        aq = fzero(n * QN);
+        ag = fzero(n * acount * 4);
+        f = 0;
+        while f < idx.len() {
+            i0 := idx[f];
+            i1 := idx[f + 1];
+            i2 := idx[f + 2];
+            p0 := pt(&pos, i0);
+            p1 := pt(&pos, i1);
+            p2 := pt(&pos, i2);
+            bases := u64[i0 * acount, i1 * acount, i2 * acount];
+            qa := from_attributes(&p0, &p1, &p2, &va, &bases, acount);
+            for v in u64[i0, i1, i2] {
+                qadd(&mut aq, v * QN, &qa, 0);
+                for k in acount * 4 {
+                    ag[v * acount * 4 + k] = ag[v * acount * 4 + k] + qa[QN + k];
+                }
+            }
+            f += 3;
+        }
+    }
+    return Quadrics { vertex: vq, attribute: aq, gradients: ag, positions: pos, attributes: va, attribute_count: acount, scale: rescaled[0] };
+}
