@@ -13,10 +13,11 @@ Ported so far:
 - `compute_sphere_bounds` (meshopt_computeSphereBounds, points or spheres)
 - `compute_meshlet_bounds` (meshopt_computeMeshletBounds, including the normal cone and its 8-bit
   SNORM form)
+- `build_meshlets_spatial` and `build_meshlets_bound` (meshopt_buildMeshletsSpatial: SAH-split
+  BVH clusters, as Abundance's cluster builder uses them)
 
-In progress: meshlet building (`buildMeshletsFlex`/`Spatial`), cluster partitioning, spatial sort
-and clustering, meshlet optimisation and the simplifier, which together back Abundance's cluster
-LOD builder.
+In progress: cluster partitioning, spatial sort and clustering, meshlet optimisation and the
+simplifier, which together with the above back Abundance's cluster LOD builder.
 
 ## Use
 
@@ -28,9 +29,10 @@ Positions are flat `f32` arrays with a stride in floats (`4` for `float4` elemen
 
 ## Tests
 
-`grail test` compares every result with meshoptimizer on inputs printed by
-`tests/reference/basics.cpp` (duplicates, signed zeros, NaN positions, degenerate and curved
-meshlets); floats are compared as their 32-bit patterns.
+`grail test` compares every result with meshoptimizer on inputs printed by the programs in
+`tests/reference/`: `basics.cpp` (duplicates, signed zeros, NaN positions, degenerate and curved
+meshlets; floats compared as their 32-bit patterns) and `meshlets.cpp` (a height field, a random
+soup and a torus under Abundance's 128/42..128/0.5 parameters and three others).
 
 ```sh
 M=<meshoptimizer>

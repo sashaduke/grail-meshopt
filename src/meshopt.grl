@@ -406,3 +406,499 @@ pub fn compute_meshlet_bounds<a, b, c>(vertices: (&a u64[]), triangles: (&b u8[]
     }
     return cluster_bounds(&indices, &corners, &positions, stride);
 }
+
+// ---- meshlets: meshopt_buildMeshletsSpatial ----
+
+pub struct Meshlet {
+    vertex_offset: u64,
+    triangle_offset: u64,
+    vertex_count: u64,
+    triangle_count: u64
+}
+
+// Meshlets plus the shared vertex and triangle arrays they index (trimmed to what is used).
+pub struct Meshlets {
+    meshlets: Meshlet[],
+    vertices: u64[],
+    triangles: u8[]
+}
+
+fn copy_u64<a>(v: (&a u64[])) -> u64[] {
+    mut out = u64[];
+    for i in v.len() {
+        out.push(v[i]);
+    }
+    return out;
+}
+fn zeros_u8(n: u64) -> u8[] {
+    mut out = u8[];
+    for i in n {
+        out.push(0);
+    }
+    return out;
+}
+
+pub fn build_meshlets_bound(index_count: u64, max_vertices: u64, max_triangles: u64) -> u64 {
+    conservative := max_vertices - 2;
+    by_vertices := (index_count + conservative - 1) / conservative;
+    by_triangles := (index_count / 3 + max_triangles - 1) / max_triangles;
+    if by_vertices > by_triangles {
+        return by_vertices;
+    }
+    return by_triangles;
+}
+
+// The state bvhSplit shares across its recursion: boxes (6 floats per face), the three sorted
+// axis orders (face_count each), boundary flags, vertex use marks and the parameters.
+struct Bvh {
+    boxes: f32[],
+    axes: u64[],
+    boundary: u8[],
+    sides: u8[],
+    used: i64[],
+    indices: u64[],
+    face_count: u64,
+    max_vertices: u64,
+    min_triangles: u64,
+    max_triangles: u64,
+    fill_weight: f32
+}
+
+fn flt_max() -> f32 {
+    m: f32 := 340282346638528859811704183484516925440.0;
+    return m;
+}
+
+// bvhCountVertices over axis k's order[base .. base+count]; per-prefix counts into `out` if asked.
+fn count_vertices<a, b>(s: (&a mut Bvh), k: u64, base: u64, count: u64, out: (&b mut u64[]), want: bool) -> u64 {
+    mut used_vertices: u64 = 0;
+    off := k * s.face_count + base;
+    for i in count {
+        f := s.axes[off + i];
+        a := s.indices[f * 3];
+        b := s.indices[f * 3 + 1];
+        c := s.indices[f * 3 + 2];
+        if s.used[a] < 0 {
+            used_vertices += 1;
+        }
+        if s.used[b] < 0 {
+            used_vertices += 1;
+        }
+        if s.used[c] < 0 {
+            used_vertices += 1;
+        }
+        s.used[a] = 1;
+        s.used[b] = 1;
+        s.used[c] = 1;
+        if want {
+            out.push(used_vertices);
+        }
+    }
+    for i in count {
+        f := s.axes[off + i];
+        s.used[s.indices[f * 3]] = -1;
+        s.used[s.indices[f * 3 + 1]] = -1;
+        s.used[s.indices[f * 3 + 2]] = -1;
+    }
+    return used_vertices;
+}
+
+fn pack_leaf<a>(s: (&a mut Bvh), base: u64, count: u64) -> unit {
+    s.boundary[base] = 1;
+    for i in count - 1 {
+        s.boundary[base + 1 + i] = 0;
+    }
+    return ();
+}
+
+fn pack_tail<a>(s: (&a mut Bvh), base: u64, count: u64) -> unit {
+    mut i: u64 = 0;
+    mut none = u64[];
+    while i < count {
+        mut chunk = count - i;
+        if i + s.max_triangles <= count {
+            chunk = s.max_triangles;
+        }
+        if count_vertices(&mut s, 0, base + i, chunk, &mut none, false) <= s.max_vertices {
+            pack_leaf(&mut s, base + i, chunk);
+            i += chunk;
+            continue;
+        }
+        third := s.max_vertices / 3;
+        pack_leaf(&mut s, base + i, third);
+        i += third;
+    }
+    return ();
+}
+
+fn divisible(count: u64, min: u64, max: u64) -> bool {
+    if min * 2 <= max {
+        return count >= min;
+    }
+    return count % min <= (count / min) * (max - min);
+}
+
+// Running surface areas from the left (areas[0..count]) and from the right (areas[count..2count]).
+fn compute_area<a>(s: (&a Bvh), k: u64, base: u64, count: u64) -> f32[] {
+    big := flt_max();
+    mut lmin = f32[big, big, big];
+    mut lmax = f32[0.0 - big, 0.0 - big, 0.0 - big];
+    mut rmin = f32[big, big, big];
+    mut rmax = f32[0.0 - big, 0.0 - big, 0.0 - big];
+    mut left = f32[];
+    mut right = f32[];
+    off := k * s.face_count + base;
+    for i in count {
+        fl := s.axes[off + i];
+        fr := s.axes[off + count - 1 - i];
+        for c in 3 {
+            v := s.boxes[fl * 6 + c];
+            if v < lmin[c] {
+                lmin[c] = v;
+            }
+            w := s.boxes[fl * 6 + 3 + c];
+            if w > lmax[c] {
+                lmax[c] = w;
+            }
+            v2 := s.boxes[fr * 6 + c];
+            if v2 < rmin[c] {
+                rmin[c] = v2;
+            }
+            w2 := s.boxes[fr * 6 + 3 + c];
+            if w2 > rmax[c] {
+                rmax[c] = w2;
+            }
+        }
+        sx := lmax[0] - lmin[0];
+        sy := lmax[1] - lmin[1];
+        sz := lmax[2] - lmin[2];
+        la: f32 := sx * sy + sy * sz + sz * sx;
+        left.push(la);
+        tx := rmax[0] - rmin[0];
+        ty := rmax[1] - rmin[1];
+        tz := rmax[2] - rmin[2];
+        ra: f32 := tx * ty + ty * tz + tz * tx;
+        right.push(ra);
+    }
+    for i in count {
+        left.push(right[i]);
+    }
+    return left;
+}
+
+// bvhPivot; returns (split, cost bits) packed as [split, f32_bits(cost)].
+struct PivotArgs {
+    count: u64,
+    step: u64,
+    min: u64,
+    max: u64,
+    fill: f32,
+    maxfill: u64
+}
+
+fn pivot<a, b>(areas: (&a f32[]), vertices: (&b u64[]), args: (&a PivotArgs)) -> u64[] {
+    count := args.count;
+    step := args.step;
+    min := args.min;
+    max := args.max;
+    fill := args.fill;
+    maxfill := args.maxfill;
+    aligned := (count >= min * 2) && divisible(count, min, max);
+    mut end = count - 1;
+    if aligned {
+        end = count - min;
+    }
+    one: f32 := 1.0;
+    rmaxfill: f32 := one / f32(i64(maxfill));
+    mut bestsplit: u64 = 0;
+    mut bestcost: f32 = flt_max();
+    mut i = min - 1;
+    while i < end {
+        lsplit := i + 1;
+        rsplit := count - (i + 1);
+        if (divisible(lsplit, min, max) == false) || (aligned && (divisible(rsplit, min, max) == false)) {
+            i += step;
+            continue;
+        }
+        larea := areas[i];
+        rarea := areas[(count - 1 - (i + 1)) + count];
+        mut cost: f32 = larea * f32(i64(lsplit)) + rarea * f32(i64(rsplit));
+        if cost > bestcost {
+            i += step;
+            continue;
+        }
+        mut lfill = lsplit;
+        mut rfill = rsplit;
+        if vertices.len() != 0 {
+            lfill = vertices[i];
+            rfill = vertices[i];
+        }
+        lrest := i64(f32(i64(lfill + maxfill - 1)) * rmaxfill) * i64(maxfill) - i64(lfill);
+        rrest := i64(f32(i64(rfill + maxfill - 1)) * rmaxfill) * i64(maxfill) - i64(rfill);
+        cost += fill * (f32(lrest) * larea + f32(rrest) * rarea);
+        if cost < bestcost {
+            bestcost = cost;
+            bestsplit = i + 1;
+        }
+        i += step;
+    }
+    return u64[bestsplit, f32_bits(bestcost)];
+}
+
+fn bvh_split<a>(s: (&a mut Bvh), base: u64, count: u64, depth: u64) -> unit {
+    mut none = u64[];
+    if (count <= s.max_triangles) && (count_vertices(&mut s, 0, base, count, &mut none, false) <= s.max_vertices) {
+        pack_leaf(&mut s, base, count);
+        return ();
+    }
+    mut step: u64 = 1;
+    if (s.min_triangles == s.max_triangles) && (count > s.max_triangles) {
+        step = s.max_triangles;
+    }
+    mut mint = s.min_triangles;
+    if (count <= s.max_triangles) && (s.max_vertices / 3 < s.min_triangles) {
+        mint = s.max_vertices / 3;
+    }
+    mut maxfill = s.max_triangles;
+    if count <= s.max_triangles {
+        maxfill = s.max_vertices;
+    }
+    mut bestk: u64 = 3;
+    mut bestsplit: u64 = 0;
+    mut bestcost: f32 = flt_max();
+    for k in 3 {
+        areas := compute_area(&s, k, base, count);
+        mut vertices = u64[];
+        if count <= s.max_triangles {
+            count_vertices(&mut s, k, base, count, &mut vertices, true);
+        }
+        pa := PivotArgs { count: count, step: step, min: mint, max: s.max_triangles, fill: s.fill_weight, maxfill: maxfill };
+        r := pivot(&areas, &vertices, &pa);
+        axiscost := f32_from_bits(r[1]);
+        if (r[0] != 0) && (axiscost < bestcost) {
+            bestk = k;
+            bestcost = axiscost;
+            bestsplit = r[0];
+        }
+    }
+    if (bestk == 3) || (50 <= depth) {
+        pack_tail(&mut s, base, count);
+        return ();
+    }
+    // Sides by face; stable partition of the other two axes.
+    for i in count {
+        f := s.axes[bestk * s.face_count + base + i];
+        if i < bestsplit {
+            s.sides[f] = 0;
+        } else {
+            s.sides[f] = 1;
+        }
+    }
+    for k in 3 {
+        if k == bestk {
+            continue;
+        }
+        off := k * s.face_count + base;
+        mut lefts = u64[];
+        mut rights = u64[];
+        for i in count {
+            f := s.axes[off + i];
+            if s.sides[f] == 0 {
+                lefts.push(f);
+            } else {
+                rights.push(f);
+            }
+        }
+        for i in lefts.len() {
+            s.axes[off + i] = lefts[i];
+        }
+        for i in rights.len() {
+            s.axes[off + bestsplit + i] = rights[i];
+        }
+    }
+    bvh_split(&mut s, base, bestsplit, depth + 1);
+    bvh_split(&mut s, base + bestsplit, count - bestsplit, depth + 1);
+    return ();
+}
+
+fn radix_key(v: u64) -> u64 {
+    mut mask: u64 = 2147483648;
+    if (v & 2147483648) != 0 {
+        mask = 4294967295;
+    }
+    return v ^ mask;
+}
+
+// Stable sort of 0..n by the float keys, as meshoptimizer's 3x10-bit radix sort (the 2 lowest
+// bits ignored, so keys equal above them keep their order).
+fn radix_order<a>(keys: (&a f32[]), n: u64) -> u64[] {
+    mut order = u64[];
+    for i in n {
+        order.push(i);
+    }
+    for pass in 3 {
+        shift := pass * 10 + 2;
+        mut hist = u64[];
+        for i in 1025 {
+            hist.push(0);
+        }
+        for i in n {
+            id := (radix_key(f32_bits(keys[i])) >> shift) & 1023;
+            hist[id + 1] = hist[id + 1] + 1;
+        }
+        for i in 1024 {
+            hist[i + 1] = hist[i + 1] + hist[i];
+        }
+        mut next = u64[];
+        for i in n {
+            next.push(0);
+        }
+        for i in n {
+            f := order[i];
+            id := (radix_key(f32_bits(keys[f])) >> shift) & 1023;
+            next[hist[id]] = f;
+            hist[id] = hist[id] + 1;
+        }
+        order = next;
+    }
+    return order;
+}
+
+fn append_meshlet<a, b, c>(m: (&a mut Meshlet), tri: (&b u64[]), out: (&c mut Meshlets), used: (&c mut i64[]), limits: (&b u64[]), split: bool) -> bool {
+    a := tri[0];
+    b := tri[1];
+    c := tri[2];
+    max_vertices := limits[0];
+    max_triangles := limits[1];
+    mut extra: u64 = 0;
+    if used[a] < 0 {
+        extra += 1;
+    }
+    if used[b] < 0 {
+        extra += 1;
+    }
+    if used[c] < 0 {
+        extra += 1;
+    }
+    mut result = false;
+    if (m.vertex_count + extra > max_vertices) || (m.triangle_count >= max_triangles) || split {
+        out.meshlets.push(Meshlet { vertex_offset: m.vertex_offset, triangle_offset: m.triangle_offset, vertex_count: m.vertex_count, triangle_count: m.triangle_count });
+        for j in m.vertex_count {
+            used[out.vertices[m.vertex_offset + j]] = -1;
+        }
+        m.vertex_offset = m.vertex_offset + m.vertex_count;
+        m.triangle_offset = m.triangle_offset + m.triangle_count * 3;
+        m.vertex_count = 0;
+        m.triangle_count = 0;
+        result = true;
+    }
+    for v in u64[a, b, c] {
+        if used[v] < 0 {
+            used[v] = i64(m.vertex_count);
+            out.vertices.push(v);
+            m.vertex_count = m.vertex_count + 1;
+        }
+    }
+    out.triangles.push(u64(used[a]));
+    out.triangles.push(u64(used[b]));
+    out.triangles.push(u64(used[c]));
+    m.triangle_count = m.triangle_count + 1;
+    return result;
+}
+
+pub fn build_meshlets_spatial<a, b>(indices: (&a u64[]), positions: (&b f32[]), vertex_count: u64, stride: u64, limits: (&a u64[]), fill_weight: f32) -> Meshlets {
+    max_vertices := limits[0];
+    min_triangles := limits[1];
+    max_triangles := limits[2];
+    mut result = Meshlets { meshlets: Meshlet[], vertices: u64[], triangles: u8[] };
+    index_count := indices.len();
+    if index_count == 0 {
+        return result;
+    }
+    fc := index_count / 3;
+    mut boxes = f32[];
+    mut cent = f32[];
+    for i in fc * 3 {
+        cent.push(0.0);
+    }
+    two: f32 := 2.0;
+    for i in fc {
+        a := indices[i * 3] * stride;
+        b := indices[i * 3 + 1] * stride;
+        c := indices[i * 3 + 2] * stride;
+        mut mins = f32[];
+        mut maxs = f32[];
+        for k in 3 {
+            va := positions[a + k];
+            vb := positions[b + k];
+            vc := positions[c + k];
+            mut lo = vb;
+            if va < vb {
+                lo = va;
+            }
+            if vc < lo {
+                lo = vc;
+            }
+            mut hi = vb;
+            if va > vb {
+                hi = va;
+            }
+            if vc > hi {
+                hi = vc;
+            }
+            mins.push(lo);
+            maxs.push(hi);
+            cent[i + fc * k] = (lo + hi) / two;
+        }
+        for k in 3 {
+            boxes.push(mins[k]);
+        }
+        for k in 3 {
+            boxes.push(maxs[k]);
+        }
+    }
+    mut axes = u64[];
+    for k in 3 {
+        mut keys = f32[];
+        for i in fc {
+            keys.push(cent[k * fc + i]);
+        }
+        order := radix_order(&keys, fc);
+        for i in fc {
+            axes.push(order[i]);
+        }
+    }
+    mut used = i64[];
+    for i in vertex_count {
+        used.push(-1);
+    }
+    mut boundary = u8[];
+    for i in fc {
+        boundary.push(0);
+    }
+    mut s = Bvh { boxes: boxes, axes: axes, boundary: boundary, used: used, sides: zeros_u8(fc), indices: copy_u64(&indices), face_count: fc, max_vertices: max_vertices, min_triangles: min_triangles, max_triangles: max_triangles, fill_weight: fill_weight };
+    bvh_split(&mut s, 0, fc, 0);
+    mut meshlet_count: u64 = 0;
+    for i in fc {
+        meshlet_count += s.boundary[i];
+    }
+    bound := build_meshlets_bound(index_count, max_vertices, min_triangles);
+    mut m = Meshlet { vertex_offset: 0, triangle_offset: 0, vertex_count: 0, triangle_count: 0 };
+    mut pending = meshlet_count;
+    mut used2 = exchange(&mut s.used, i64[]);
+    alimits := u64[max_vertices, max_triangles];
+    for i in fc {
+        mut split = (i > 0) && (s.boundary[i] == 1);
+        if split && (meshlet_count > bound) && (result.meshlets.len() + pending >= bound) {
+            split = false;
+        }
+        f := s.axes[i];
+        tri := u64[indices[f * 3], indices[f * 3 + 1], indices[f * 3 + 2]];
+        append_meshlet(&mut m, &tri, &mut result, &mut used2, &alimits, split);
+        pending -= s.boundary[i];
+    }
+    if m.triangle_count != 0 {
+        result.meshlets.push(m);
+    }
+    return result;
+}

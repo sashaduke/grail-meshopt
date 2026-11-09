@@ -1,0 +1,137 @@
+use meshopt;
+use collections;
+use fs;
+use io;
+
+// Checks build_meshlets_spatial against meshopt_buildMeshletsSpatial (tests/reference/meshlets.cpp
+// -> tests/meshlets_expected.txt): meshlet records, meshlet vertices and meshlet triangles must be
+// identical for every mesh and parameter set. Returns the number of failures.
+
+fn read_all<a>(path: &a [u8]) -> u8[] {
+    match fs::read(path) {
+        d: u8[] => { return d; },
+        e: io::Error => { println("cannot read tests/meshlets_expected.txt"); return u8[]; }
+    }
+}
+fn number<a>(text: &a [u8]) -> u64 {
+    mut v: u64 = 0;
+    mut neg = false;
+    for i in text.len() {
+        if text[i] == 45 {
+            neg = true;
+        } else {
+            v = v * 10 + (text[i] - 48);
+        }
+    }
+    return v;
+}
+fn signed<a>(text: &a [u8]) -> i64 {
+    if text[0] == 45 {
+        return 0 - i64(number(&text[1: text.len()]));
+    }
+    return i64(number(&text));
+}
+fn same<a, b>(x: &a [u8], y: &b [u8]) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    for i in x.len() {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+fn main() -> u64 {
+    text := read_all("tests/meshlets_expected.txt");
+    mut failures: u64 = 0;
+    mut checks: u64 = 0;
+    mut pos = f32[];
+    mut idx = u64[];
+    mut count: u64 = 0;
+    mut got = meshopt::Meshlets { meshlets: collections::new<meshopt::Meshlet>(), vertices: u64[], triangles: u8[] };
+    mut start: u64 = 0;
+    for i in text.len() {
+        if text[i] != 10 {
+            continue;
+        }
+        mut f = u8[][];
+        mut s = start;
+        while s < i {
+            mut e = s;
+            while (e < i) && (text[e] != 32) {
+                e += 1;
+            }
+            f.push(text[s: e].copy());
+            s = e + 1;
+        }
+        start = i + 1;
+        tag := f[0].copy();
+        if same(&tag, "pos") {
+            count = number(&f[1]);
+            pos = f32[];
+            for k in count * 4 {
+                pos.push(f32_from_bits(number(&f[k + 2])));
+            }
+            continue;
+        }
+        if same(&tag, "idx") {
+            idx = u64[];
+            for k in number(&f[1]) {
+                idx.push(number(&f[k + 2]));
+            }
+            continue;
+        }
+        checks += 1;
+        mut ok = true;
+        if same(&tag, "meshlets") {
+            limits := u64[number(&f[1]), number(&f[2]), number(&f[3])];
+            fill := f32_from_bits(number(&f[4]));
+            got = meshopt::build_meshlets_spatial(&idx, &pos, count, 4, &limits, fill);
+            n := number(&f[5]);
+            if got.meshlets.len() != n {
+                ok = false;
+            } else {
+                for m in n {
+                    g := &got.meshlets[m];
+                    if (g.vertex_offset != number(&f[6 + m * 4])) || (g.triangle_offset != number(&f[7 + m * 4])) || (g.vertex_count != number(&f[8 + m * 4])) || (g.triangle_count != number(&f[9 + m * 4])) {
+                        ok = false;
+                    }
+                }
+            }
+            if ok == false {
+                println("FAIL meshlets {} {} {}: {} meshlets, want {}", number(&f[1]), number(&f[2]), number(&f[3]), got.meshlets.len(), n);
+            }
+        }
+        if same(&tag, "mv") {
+            n := number(&f[1]);
+            if got.vertices.len() != n {
+                ok = false;
+            } else {
+                for k in n {
+                    if got.vertices[k] != number(&f[k + 2]) {
+                        ok = false;
+                    }
+                }
+            }
+        }
+        if same(&tag, "mt") {
+            n := number(&f[1]);
+            if got.triangles.len() != n {
+                ok = false;
+            } else {
+                for k in n {
+                    if got.triangles[k] != number(&f[k + 2]) {
+                        ok = false;
+                    }
+                }
+            }
+        }
+        if ok == false {
+            println("FAIL {} (check {})", tag.text(), checks);
+            failures += 1;
+        }
+    }
+    println("{} checks, {} failures", checks, failures);
+    return failures;
+}
