@@ -23,7 +23,12 @@ Ported so far:
   wedge rings, vertex classification and edge loops) and `fill_quadrics` (face, vertex, edge, fold
   and attribute quadrics)
 
-In progress: the simplifier collapse loop and meshlet optimisation, which together
+- `simplify` (meshopt_simplify / meshopt_simplifyWithAttributes): quadric edge collapse with
+  seams, borders, locked and protected vertices, attribute quadrics, `Sparse`, `ErrorAbsolute`,
+  `ErrorClamped`, `Permissive`, `Regularize`, `RegularizeLight`, `LockBorder` and `PreserveFolds`
+  (`Prune` is not ported yet and returns None)
+
+In progress: meshlet optimisation, which together
 with the above back Abundance's cluster LOD builder.
 
 ## Use

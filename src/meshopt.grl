@@ -2381,3 +2381,454 @@ pub fn fill_quadrics<a, b, c>(p: (&a Prepared), positions: (&b f32[]), stride: u
     }
     return Quadrics { vertex: vq, attribute: aq, gradients: ag, positions: pos, attributes: va, attribute_count: acount, scale: rescaled[0] };
 }
+
+// ---- simplifier collapse loop (meshopt_simplifyWithAttributes) ----
+
+fn can_collapse(a: u64, b: u64) -> u64 {
+    table := u64[1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+    return table[a * 6 + b];
+}
+fn has_opposite(a: u64, b: u64) -> u64 {
+    table := u64[1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0];
+    return table[a * 6 + b];
+}
+
+fn quadric_error<a>(q: (&a f32[]), at: u64, x: f32, y: f32, z: f32) -> f32 {
+    r := quadric_eval(&q, at, x, y, z);
+    mut s: f32 = 0.0;
+    if q[at + 10] != 0.0 {
+        one: f32 := 1.0;
+        s = one / q[at + 10];
+    }
+    return r.abs() * s;
+}
+
+// quadricError with attributes: q at qa, gradients g at ga (4 per attribute), position (x,y,z),
+// attribute values va at vb.
+fn quadric_error_attr<a>(st: (&a Quadrics), v: u64, t: u64, clamped: bool) -> f32 {
+    acount := st.attribute_count;
+    qa := v * QN;
+    x := st.positions[t * 3];
+    y := st.positions[t * 3 + 1];
+    z := st.positions[t * 3 + 2];
+    mut r = quadric_eval(&st.attribute, qa, x, y, z);
+    two: f32 := 2.0;
+    for k in acount {
+        a := st.attributes[t * acount + k];
+        g0 := (v * acount + k) * 4;
+        gx := st.gradients[g0];
+        gy := st.gradients[g0 + 1];
+        gz := st.gradients[g0 + 2];
+        gw := st.gradients[g0 + 3];
+        g: f32 := x * gx + y * gy + z * gz + gw;
+        r = r + a * (a * st.attribute[qa + 10] - two * g);
+    }
+    e := r.abs();
+    if clamped && ((e < st.attribute[qa + 10]) == false) {
+        return st.attribute[qa + 10];
+    }
+    return e;
+}
+
+fn complex_target<a>(p: (&a Prepared), v: u64, target: u64) -> u64 {
+    r := p.remap[target];
+    if (p.loop[v] != NONE32) && (p.remap[p.loop[v]] == r) {
+        return p.loop[v];
+    }
+    if (p.loopback[v] != NONE32) && (p.remap[p.loopback[v]] == r) {
+        return p.loopback[v];
+    }
+    return target;
+}
+
+fn triangle_flip<a>(pos: (&a f32[]), a: u64, b: u64, c: u64, d: u64) -> bool {
+    ax := pos[a * 3];
+    ay := pos[a * 3 + 1];
+    az := pos[a * 3 + 2];
+    ebx := pos[b * 3] - ax;
+    eby := pos[b * 3 + 1] - ay;
+    ebz := pos[b * 3 + 2] - az;
+    ecx := pos[c * 3] - ax;
+    ecy := pos[c * 3 + 1] - ay;
+    ecz := pos[c * 3 + 2] - az;
+    edx := pos[d * 3] - ax;
+    edy := pos[d * 3 + 1] - ay;
+    edz := pos[d * 3 + 2] - az;
+    nbcx := eby * ecz - ebz * ecy;
+    nbcy := ebz * ecx - ebx * ecz;
+    nbcz := ebx * ecy - eby * ecx;
+    nbdx := eby * edz - ebz * edy;
+    nbdy := ebz * edx - ebx * edz;
+    nbdz := ebx * edy - eby * edx;
+    ndp: f32 := nbcx * nbdx + nbcy * nbdy + nbcz * nbdz;
+    abc: f32 := nbcx * nbcx + nbcy * nbcy + nbcz * nbcz;
+    abd: f32 := nbdx * nbdx + nbdy * nbdy + nbdz * nbdz;
+    quarter: f32 := 0.25;
+    prod: f32 := abc * abd;
+    return ndp <= quarter * prod.sqrt();
+}
+
+fn triangle_flips<a, b>(adj: (&a Adjacency3), pos: (&b f32[]), cremap: (&b u64[]), i0: u64, i1: u64) -> bool {
+    mut k = adj.offsets[i0];
+    while k < adj.offsets[i0 + 1] {
+        a := cremap[adj.next[k]];
+        b := cremap[adj.prev[k]];
+        k += 1;
+        if (a == i1) || (b == i1) || (a == b) {
+            continue;
+        }
+        if triangle_flip(&pos, a, b, i0, i1) {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub struct Simplified {
+    indices: u64[],
+    error: f32
+}
+
+// meshopt_simplifyWithAttributes (and meshopt_simplify with no attributes). Prune and the
+// internal solve/debug flags are not supported (None).
+pub fn simplify<a, b, c>(indices: (&a u64[]), positions: (&b f32[]), vertex_count: u64, stride: u64, attrs: (&c f32[]), astride: u64, weights: (&c f32[]), lock: (&a u8[]), targets: (&c f32[]), options: u64) -> Simplified? {
+    if (options & SIMPLIFY_PRUNE) != 0 {
+        return None;
+    }
+    target_index_count := u64(i64(targets[0]));
+    target_error := targets[1];
+    p := simplify_prepare(&indices, &positions, vertex_count, stride, &lock, options);
+    mut st = fill_quadrics(&p, &positions, stride, &attrs, astride, &weights, &lock, options);
+    n := p.vertex_count;
+    mut result = p.indices.copy();
+    mut loop = p.loop.copy();
+    mut loopback = p.loopback.copy();
+    mut kinds = p.kind.copy();
+    mut adj = Adjacency3 { offsets: u64[], next: u64[], prev: u64[] };
+    clamped := (options & SIMPLIFY_ERROR_CLAMPED) != 0;
+    mut error_scale: f32 = 1.0;
+    if (options & SIMPLIFY_ERROR_ABSOLUTE) != 0 {
+        error_scale = st.scale;
+    }
+    error_limit: f32 := (target_error * target_error) / (error_scale * error_scale);
+    mut result_count = result.len();
+    mut result_error: f32 = 0.0;
+    mut vertex_error: f32 = 0.0;
+    acount := st.attribute_count;
+    big := flt_max();
+    mut cremap = u64[];
+    mut clocked = u8[];
+    for i in n {
+        cremap.push(i);
+        clocked.push(0);
+    }
+    // The current state as a Prepared view for helpers that read loops.
+    mut state = Prepared { indices: u64[], vertex_count: n, sparse_remap: u64[], adjacency: Adjacency3 { offsets: u64[], next: u64[], prev: u64[] }, remap: p.remap.copy(), wedge: p.wedge.copy(), kind: kinds.copy(), loop: u64[], loopback: u64[] };
+    while result_count > target_index_count {
+        update_adjacency(&mut adj, &result, result_count, n, &p.remap);
+        // pickEdgeCollapses
+        mut cv0 = u64[];
+        mut cv1 = u64[];
+        mut cbidi = u64[];
+        nexte := u64[1, 2, 0];
+        mut f: u64 = 0;
+        while f < result_count {
+            for e in 3 {
+                i0 := result[f + e];
+                i1 := result[f + nexte[e]];
+                if p.remap[i0] == p.remap[i1] {
+                    continue;
+                }
+                k0 := kinds[i0];
+                k1 := kinds[i1];
+                if (can_collapse(k0, k1) | can_collapse(k1, k0)) == 0 {
+                    continue;
+                }
+                if (has_opposite(k0, k1) != 0) && (p.remap[i1] > p.remap[i0]) {
+                    continue;
+                }
+                if ((k0 == KIND_BORDER) || (k0 == KIND_SEAM)) && (k1 != KIND_MANIFOLD) && (loop[i0] != i1) {
+                    continue;
+                }
+                if ((k1 == KIND_BORDER) || (k1 == KIND_SEAM)) && (k0 != KIND_MANIFOLD) && (loopback[i1] != i0) {
+                    continue;
+                }
+                if (can_collapse(k0, k1) & can_collapse(k1, k0)) != 0 {
+                    cv0.push(i0);
+                    cv1.push(i1);
+                    cbidi.push(1);
+                } else {
+                    if can_collapse(k0, k1) != 0 {
+                        cv0.push(i0);
+                        cv1.push(i1);
+                    } else {
+                        cv0.push(i1);
+                        cv1.push(i0);
+                    }
+                    cbidi.push(0);
+                }
+            }
+            f += 3;
+        }
+        count := cv0.len();
+        if count == 0 {
+            break;
+        }
+        state.loop = loop.copy();
+        state.loopback = loopback.copy();
+        // rankEdgeCollapses
+        mut cerr = f32[];
+        for ci in count {
+            i0 := cv0[ci];
+            i1 := cv1[ci];
+            bidi := cbidi[ci] != 0;
+            mut ei = quadric_error(&st.vertex, p.remap[i0] * QN, st.positions[i1 * 3], st.positions[i1 * 3 + 1], st.positions[i1 * 3 + 2]);
+            mut ej = big;
+            if bidi {
+                ej = quadric_error(&st.vertex, p.remap[i1] * QN, st.positions[i0 * 3], st.positions[i0 * 3 + 1], st.positions[i0 * 3 + 2]);
+            }
+            if acount != 0 {
+                ei = ei + quadric_error_attr(&st, i0, i1, clamped);
+                if bidi {
+                    ej = ej + quadric_error_attr(&st, i1, i0, clamped);
+                }
+                if kinds[i0] == KIND_SEAM {
+                    s0 := p.wedge[i0];
+                    mut s1 = loop[s0];
+                    if loop[i0] == i1 {
+                        s1 = loopback[s0];
+                    }
+                    if s1 == NONE32 {
+                        s1 = p.wedge[i1];
+                    }
+                    ei = ei + quadric_error_attr(&st, s0, s1, clamped);
+                    if bidi {
+                        ej = ej + quadric_error_attr(&st, s1, s0, clamped);
+                    }
+                } else {
+                    if (kinds[i0] == KIND_COMPLEX) || (kinds[i0] == KIND_FRINGE) {
+                        mut v = p.wedge[i0];
+                        while v != i0 {
+                            t := complex_target(&state, v, i1);
+                            ei = ei + quadric_error_attr(&st, v, t, clamped);
+                            v = p.wedge[v];
+                        }
+                    }
+                    if ((kinds[i1] == KIND_COMPLEX) || (kinds[i1] == KIND_FRINGE)) && bidi {
+                        mut v = p.wedge[i1];
+                        while v != i1 {
+                            t := complex_target(&state, v, i0);
+                            ej = ej + quadric_error_attr(&st, v, t, clamped);
+                            v = p.wedge[v];
+                        }
+                    }
+                }
+            }
+            if bidi && (ej < ei) {
+                cv0[ci] = i1;
+                cv1[ci] = i0;
+            }
+            if ej < ei {
+                cerr.push(ej);
+            } else {
+                cerr.push(ei);
+            }
+        }
+        // sortEdgeCollapses: 12-bit buckets of the error bits (sign dropped), stable.
+        mut hist = u64[];
+        for i in 2560 {
+            hist.push(0);
+        }
+        mut keys = u64[];
+        for ci in count {
+            bitsv := f32_bits(cerr[ci]);
+            mut key = ((bitsv << 1) & 4294967295) >> 20;
+            if 2559 < key {
+                key = 2559;
+            }
+            keys.push(key);
+            hist[key] = hist[key] + 1;
+        }
+        mut sum: u64 = 0;
+        for i in 2560 {
+            c := hist[i];
+            hist[i] = sum;
+            sum += c;
+        }
+        mut order = u64[];
+        for ci in count {
+            order.push(0);
+        }
+        for ci in count {
+            order[hist[keys[ci]]] = ci;
+            hist[keys[ci]] = hist[keys[ci]] + 1;
+        }
+        // performEdgeCollapses
+        goal := (result_count - target_index_count) / 3;
+        for i in n {
+            cremap[i] = i;
+            clocked[i] = 0;
+        }
+        mut edge_collapses: u64 = 0;
+        mut tri_collapses: u64 = 0;
+        mut edge_goal = goal / 2;
+        onehalf: f32 := 1.5;
+        for oi in count {
+            ci := order[oi];
+            err := cerr[ci];
+            if err > error_limit {
+                break;
+            }
+            if tri_collapses >= goal {
+                break;
+            }
+            mut error_goal = big;
+            if edge_goal < count {
+                error_goal = onehalf * cerr[order[edge_goal]];
+            }
+            if (err > error_goal) && (err > result_error) && (tri_collapses > goal / 6) {
+                break;
+            }
+            i0 := cv0[ci];
+            i1 := cv1[ci];
+            r0 := p.remap[i0];
+            r1 := p.remap[i1];
+            kind := kinds[i0];
+            if (clocked[r0] | clocked[r1]) != 0 {
+                continue;
+            }
+            if triangle_flips(&adj, &st.positions, &cremap, r0, r1) {
+                edge_goal += 1;
+                continue;
+            }
+            if (kind == KIND_COMPLEX) || (kind == KIND_FRINGE) {
+                cremap[i0] = i1;
+                mut v = p.wedge[i0];
+                while v != i0 {
+                    cremap[v] = complex_target(&state, v, i1);
+                    v = p.wedge[v];
+                }
+            } else {
+                if kind == KIND_SEAM {
+                    s0 := p.wedge[i0];
+                    mut s1 = loop[s0];
+                    if loop[i0] == i1 {
+                        s1 = loopback[s0];
+                    }
+                    if s1 == NONE32 {
+                        s1 = p.wedge[i1];
+                    }
+                    cremap[i0] = i1;
+                    cremap[s0] = s1;
+                } else {
+                    cremap[i0] = i1;
+                }
+            }
+            clocked[r0] = 1;
+            clocked[r1] = 1;
+            if kind == KIND_BORDER {
+                tri_collapses += 1;
+            } else {
+                tri_collapses += 2;
+            }
+            edge_collapses += 1;
+            if result_error < err {
+                result_error = err;
+            }
+        }
+        if edge_collapses == 0 {
+            break;
+        }
+        // updateQuadrics
+        for i in n {
+            if cremap[i] == i {
+                continue;
+            }
+            i0 := i;
+            i1 := cremap[i];
+            r0 := p.remap[i0];
+            r1 := p.remap[i1];
+            if i0 == r0 {
+                for k in QN {
+                    st.vertex[r1 * QN + k] = st.vertex[r1 * QN + k] + st.vertex[r0 * QN + k];
+                }
+            }
+            if acount != 0 {
+                for k in QN {
+                    st.attribute[i1 * QN + k] = st.attribute[i1 * QN + k] + st.attribute[i0 * QN + k];
+                }
+                for k in acount * 4 {
+                    st.gradients[i1 * acount * 4 + k] = st.gradients[i1 * acount * 4 + k] + st.gradients[i0 * acount * 4 + k];
+                }
+                if i0 == r0 {
+                    derr := quadric_error(&st.vertex, r0 * QN, st.positions[r1 * 3], st.positions[r1 * 3 + 1], st.positions[r1 * 3 + 2]);
+                    if vertex_error < derr {
+                        vertex_error = derr;
+                    }
+                }
+            }
+        }
+        if acount == 0 {
+            vertex_error = result_error;
+        }
+        // remapEdgeLoops (in place, in order)
+        for i in n {
+            if loop[i] != NONE32 {
+                l := loop[i];
+                r := cremap[l];
+                if i == r {
+                    if loop[l] != NONE32 {
+                        loop[i] = cremap[loop[l]];
+                    } else {
+                        loop[i] = NONE32;
+                    }
+                } else {
+                    loop[i] = r;
+                }
+            }
+        }
+        for i in n {
+            if loopback[i] != NONE32 {
+                l := loopback[i];
+                r := cremap[l];
+                if i == r {
+                    if loopback[l] != NONE32 {
+                        loopback[i] = cremap[loopback[l]];
+                    } else {
+                        loopback[i] = NONE32;
+                    }
+                } else {
+                    loopback[i] = r;
+                }
+            }
+        }
+        // remapIndexBuffer
+        mut write: u64 = 0;
+        mut t: u64 = 0;
+        while t < result_count {
+            v0 := cremap[result[t]];
+            v1 := cremap[result[t + 1]];
+            v2 := cremap[result[t + 2]];
+            r0 := p.remap[v0];
+            r1 := p.remap[v1];
+            r2 := p.remap[v2];
+            if (r0 != r1) && (r0 != r2) && (r1 != r2) {
+                result[write] = v0;
+                result[write + 1] = v1;
+                result[write + 2] = v2;
+                write += 3;
+            }
+            t += 3;
+        }
+        result_count = write;
+    }
+    mut out = u64[];
+    for i in result_count {
+        if p.sparse_remap.len() != 0 {
+            out.push(p.sparse_remap[result[i]]);
+        } else {
+            out.push(result[i]);
+        }
+    }
+    return Some(Simplified { indices: out, error: result_error.sqrt() * error_scale });
+}
