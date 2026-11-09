@@ -28,7 +28,11 @@ Ported so far:
   `ErrorClamped`, `Permissive`, `Regularize`, `RegularizeLight`, `LockBorder` and `PreserveFolds`
   (`Prune` is not ported yet and returns None)
 
-In progress: meshlet optimisation, which together
+- `compute_cluster_bounds`, `extract_meshlet_indices`, `optimize_meshlet_level`
+  (meshopt_computeClusterBounds / extractMeshletIndices / optimizeMeshletLevel)
+
+In progress: `simplify_sloppy` and `simplify_scale`, the remaining pieces of Abundance's cluster LOD
+path, which together
 with the above back Abundance's cluster LOD builder.
 
 ## Use

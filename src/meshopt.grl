@@ -2832,3 +2832,225 @@ pub fn simplify<a, b, c>(indices: (&a u64[]), positions: (&b f32[]), vertex_coun
     }
     return Some(Simplified { indices: out, error: result_error.sqrt() * error_scale });
 }
+
+// ---- meshlet utilities ----
+
+// meshopt_computeClusterBounds: bounds of an arbitrary triangle cluster (up to 512 triangles).
+// The corner list is built with meshoptimizer's 512-entry direct-mapped dedup cache, so it can hold
+// repeats exactly as the C++ does.
+pub fn compute_cluster_bounds<a, b>(indices: (&a u64[]), positions: (&b f32[]), stride: u64) -> Bounds {
+    mut cache = u64[];
+    for i in 512 {
+        cache.push(NONE32);
+    }
+    mut corners = u64[];
+    for i in indices.len() {
+        v := indices[i];
+        slot := v & 511;
+        if cache[slot] != v {
+            corners.push(v);
+        }
+        cache[slot] = v;
+    }
+    return cluster_bounds(&indices, &corners, &positions, stride);
+}
+
+// meshopt_extractMeshletIndices: local vertex list and byte triangles for a cluster's indices.
+pub fn extract_meshlet_indices<a>(indices: (&a u64[])) -> Meshlets {
+    mut cache = i64[];
+    for i in 1024 {
+        cache.push(-1);
+    }
+    mut vertices = u64[];
+    mut triangles = u8[];
+    for i in indices.len() {
+        v := indices[i];
+        key := v & 1023;
+        c := cache[key];
+        if (c >= 0) && (vertices[u64(c)] == v) {
+            triangles.push(u64(c));
+            continue;
+        }
+        if c < 0 {
+            cache[key] = i64(vertices.len());
+            triangles.push(vertices.len());
+            vertices.push(v);
+            continue;
+        }
+        mut pos: i64 = -1;
+        for j in vertices.len() {
+            if (pos < 0) && (vertices[j] == v) {
+                pos = i64(j);
+            }
+        }
+        if pos < 0 {
+            pos = i64(vertices.len());
+            vertices.push(v);
+        }
+        cache[key] = pos;
+        triangles.push(u64(pos));
+    }
+    mut ms = Meshlet[];
+    ms.push(Meshlet { vertex_offset: 0, triangle_offset: 0, vertex_count: vertices.len(), triangle_count: indices.len() / 3 });
+    return Meshlets { meshlets: ms, vertices: vertices, triangles: triangles };
+}
+
+// meshopt_optimizeMeshletLevel: reorders a meshlet's triangles for locality (cache timestamps are
+// 8-bit and wrap, as in C), rotates triangles at level >= 1, and renumbers the local vertices in
+// first-use order. Returns the new vertex list and triangles.
+pub fn optimize_meshlet_level<a, b>(vertices: (&a u64[]), triangles: (&b u8[]), level: u64) -> Meshlets {
+    vc := vertices.len();
+    tc := triangles.len() / 3;
+    mut idx = triangles.copy();
+    mut cache = u64[];
+    mut valence = u64[];
+    for i in vc {
+        cache.push(0);
+        valence.push(0);
+    }
+    mut cache_last: u64 = 128;
+    cutoff: u64 := 3;
+    for i in tc * 3 {
+        valence[idx[i]] = valence[idx[i]] + 1;
+    }
+    for i in tc {
+        mut next: i64 = -1;
+        mut next_score: i64 = -1;
+        mut edges: u64 = 0;
+        mut j = i;
+        while j < tc {
+            a := idx[j * 3];
+            b := idx[j * 3 + 1];
+            c := idx[j * 3 + 2];
+            ad := wrapping_sub(cache_last, cache[a]) & 255;
+            bd := wrapping_sub(cache_last, cache[b]) & 255;
+            cd := wrapping_sub(cache_last, cache[c]) & 255;
+            mut matchc: i64 = 0;
+            if ad < cutoff {
+                matchc += 1;
+            }
+            if bd < cutoff {
+                matchc += 1;
+            }
+            if cd < cutoff {
+                matchc += 1;
+            }
+            if level != 0 {
+                mut vmin = valence[a];
+                if valence[b] < vmin {
+                    vmin = valence[b];
+                }
+                if valence[c] < vmin {
+                    vmin = valence[c];
+                }
+                mut score = matchc * 1024 + (1023 - i64(ad) - i64(bd) - i64(cd));
+                score = score * 256 + (255 - i64(vmin));
+                if score > next_score {
+                    next = i64(j);
+                    next_score = score;
+                }
+                if matchc >= 2 {
+                    edges += 1;
+                    if edges >= level {
+                        break;
+                    }
+                }
+            } else {
+                if matchc > next_score {
+                    next = i64(j);
+                    next_score = matchc;
+                }
+                if matchc >= 2 {
+                    break;
+                }
+            }
+            j += 1;
+        }
+        n := u64(next);
+        a := idx[n * 3];
+        b := idx[n * 3 + 1];
+        c := idx[n * 3 + 2];
+        mut k = n * 3 + 2;
+        while k >= i * 3 + 3 {
+            idx[k] = idx[k - 3];
+            k -= 1;
+        }
+        idx[i * 3] = a;
+        idx[i * 3 + 1] = b;
+        idx[i * 3 + 2] = c;
+        cache_last = (cache_last + 1) & 255;
+        cache[a] = cache_last;
+        cache[b] = cache_last;
+        cache[c] = cache_last;
+        valence[a] = valence[a] - 1;
+        valence[b] = valence[b] - 1;
+        valence[c] = valence[c] - 1;
+    }
+    if level >= 1 {
+        for i in vc {
+            cache[i] = 0;
+        }
+        for i in tc {
+            mut a = idx[i * 3];
+            mut b = idx[i * 3 + 1];
+            mut c = idx[i * 3 + 2];
+            if (cache[a] == 0) && (cache[b] != 0) && (cache[c] == 0) {
+                t := a;
+                a = b;
+                b = c;
+                c = t;
+            } else {
+                if (cache[a] == 0) && (cache[b] == 0) && (cache[c] == 0) {
+                    mut needab = false;
+                    mut needbc = false;
+                    mut needca = false;
+                    mut j = i + 1;
+                    while (j < tc) && (j <= i + cutoff) {
+                        oa := idx[j * 3];
+                        ob := idx[j * 3 + 1];
+                        oc := idx[j * 3 + 2];
+                        needab = needab || ((oa == b) && (ob == a)) || ((ob == b) && (oc == a)) || ((oc == b) && (oa == a));
+                        needbc = needbc || ((oa == c) && (ob == b)) || ((ob == c) && (oc == b)) || ((oc == c) && (oa == b));
+                        needca = needca || ((oa == a) && (ob == c)) || ((ob == a) && (oc == c)) || ((oc == a) && (oa == c));
+                        j += 1;
+                    }
+                    if needab && (needbc == false) {
+                        t := a;
+                        a = b;
+                        b = c;
+                        c = t;
+                    } else {
+                        if (needab && (needca == false)) || ((needab == false) && needbc && (needca == false)) {
+                            t := c;
+                            c = b;
+                            b = a;
+                            a = t;
+                        }
+                    }
+                }
+            }
+            idx[i * 3] = a;
+            idx[i * 3 + 1] = b;
+            idx[i * 3 + 2] = c;
+            cache[a] = 1;
+            cache[b] = 1;
+            cache[c] = 1;
+        }
+    }
+    mut remap = i64[];
+    for i in vc {
+        remap.push(-1);
+    }
+    mut order = u64[];
+    for i in tc * 3 {
+        t := idx[i];
+        if remap[t] < 0 {
+            remap[t] = i64(order.len());
+            order.push(vertices[t]);
+        }
+        idx[i] = u64(remap[t]);
+    }
+    mut ms = Meshlet[];
+    ms.push(Meshlet { vertex_offset: 0, triangle_offset: 0, vertex_count: order.len(), triangle_count: tc });
+    return Meshlets { meshlets: ms, vertices: order, triangles: idx };
+}
