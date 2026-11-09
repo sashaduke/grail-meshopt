@@ -1,0 +1,184 @@
+use meshopt;
+use collections;
+use fs;
+use io;
+
+// Checks generate_position_remap, generate_vertex_remap_multi, compute_sphere_bounds and
+// compute_meshlet_bounds against meshoptimizer (tests/reference/basics.cpp ->
+// tests/basics_expected.txt): the C++ program prints its inputs and its results with floats as
+// 32-bit patterns, and every result must match exactly. Returns the number of failures.
+
+fn read_all<a>(path: &a [u8]) -> u8[] {
+    match fs::read(path) {
+        d: u8[] => { return d; },
+        e: io::Error => { println("cannot read tests/basics_expected.txt"); return u8[]; }
+    }
+}
+fn number<a>(text: &a [u8]) -> u64 {
+    mut v: u64 = 0;
+    mut neg = false;
+    for i in text.len() {
+        if text[i] == 45 {
+            neg = true;
+        } else {
+            v = v * 10 + (text[i] - 48);
+        }
+    }
+    return v;
+}
+fn signed<a>(text: &a [u8]) -> i64 {
+    if text[0] == 45 {
+        return 0 - i64(number(&text[1: text.len()]));
+    }
+    return i64(number(&text));
+}
+fn same<a, b>(x: &a [u8], y: &b [u8]) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    for i in x.len() {
+        if x[i] != y[i] {
+            return false;
+        }
+    }
+    return true;
+}
+fn bounds_ok<a>(b: (&a meshopt::Bounds), f: (&a u8[][])) -> bool {
+    floats := f32[b.center[0], b.center[1], b.center[2], b.radius, b.cone_apex[0], b.cone_apex[1], b.cone_apex[2], b.cone_axis[0], b.cone_axis[1], b.cone_axis[2], b.cone_cutoff];
+    for i in 11 {
+        if f32_bits(floats[i]) != number(&f[i + 1]) {
+            return false;
+        }
+    }
+    ints := i64[b.cone_axis_s8[0], b.cone_axis_s8[1], b.cone_axis_s8[2], b.cone_cutoff_s8];
+    for i in 4 {
+        if ints[i] != signed(&f[i + 12]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn main() -> u64 {
+    text := read_all("tests/basics_expected.txt");
+    mut failures: u64 = 0;
+    mut checks: u64 = 0;
+    mut pos = f32[];
+    mut idx = u64[];
+    mut attr = u8[];
+    mut count: u64 = 0;
+    mut mv = u64[];
+    mut mt = u8[];
+    mut tc: u64 = 0;
+    mut start: u64 = 0;
+    for i in text.len() {
+        if text[i] != 10 {
+            continue;
+        }
+        mut f = u8[][];
+        mut s = start;
+        while s < i {
+            mut e = s;
+            while (e < i) && (text[e] != 32) {
+                e += 1;
+            }
+            f.push(text[s: e].copy());
+            s = e + 1;
+        }
+        start = i + 1;
+        tag := f[0].copy();
+        if same(&tag, "pos") {
+            count = number(&f[1]);
+            pos = f32[];
+            for k in count * 4 {
+                pos.push(f32_from_bits(number(&f[k + 2])));
+            }
+            continue;
+        }
+        if same(&tag, "idx") {
+            idx = u64[];
+            for k in number(&f[1]) {
+                idx.push(number(&f[k + 2]));
+            }
+            continue;
+        }
+        if same(&tag, "attr") {
+            attr = u8[];
+            for k in number(&f[1]) {
+                attr.push(number(&f[k + 2]));
+            }
+            continue;
+        }
+        if same(&tag, "meshlet") {
+            vc := number(&f[1]);
+            tc = number(&f[2]);
+            mv = u64[];
+            mt = u8[];
+            for k in vc {
+                mv.push(number(&f[k + 3]));
+            }
+            for k in tc * 3 {
+                mt.push(number(&f[vc + k + 3]));
+            }
+            continue;
+        }
+        checks += 1;
+        mut ok = true;
+        if same(&tag, "posremap") {
+            r := meshopt::generate_position_remap(&pos, count, 4);
+            for k in count {
+                if r[k] != number(&f[k + 2]) {
+                    ok = false;
+                }
+            }
+        }
+        if same(&tag, "vremap") {
+            mut pbytes = u8[];
+            for k in pos.len() {
+                b := f32_bits(pos[k]);
+                for j in 4 {
+                    pbytes.push((b >> (j * 8)) & 255);
+                }
+            }
+            mut streams = collections::new<meshopt::Stream>();
+            streams.push(meshopt::Stream { data: pbytes, size: 12, stride: 16 });
+            streams.push(meshopt::Stream { data: attr.copy(), size: 5, stride: 6 });
+            r := meshopt::generate_vertex_remap_multi(&idx, idx.len(), count, &streams);
+            if r[count] != number(&f[2]) {
+                ok = false;
+            }
+            for k in count {
+                if r[k] != number(&f[k + 3]) {
+                    ok = false;
+                }
+            }
+        }
+        if same(&tag, "points") {
+            none := f32[];
+            b := meshopt::compute_sphere_bounds(&pos, count, 4, &none, 0);
+            ok = bounds_ok(&b, &f);
+        }
+        if same(&tag, "spheres") {
+            mut radii = f32[];
+            for k in count * 4 {
+                radii.push(pos[k]);
+            }
+            mut shifted = f32[];
+            for k in count * 4 - 3 {
+                shifted.push(pos[k + 3]);
+            }
+            b := meshopt::compute_sphere_bounds(&pos, count, 4, &shifted, 4);
+            ok = bounds_ok(&b, &f);
+        }
+        if same(&tag, "mbounds") {
+            b := meshopt::compute_meshlet_bounds(&mv, &mt, tc, &pos, 4);
+            ok = bounds_ok(&b, &f);
+        }
+        if ok == false {
+            println("FAIL {} (check {})", tag.text(), checks);
+            failures += 1;
+        }
+    }
+    println("{} checks, {} failures", checks, failures);
+    return failures;
+}

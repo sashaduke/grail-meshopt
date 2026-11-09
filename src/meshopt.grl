@@ -1,0 +1,408 @@
+module meshopt;
+use hashmap;
+
+// A port of meshoptimizer 1.3 (https://github.com/zeux/meshoptimizer, MIT) with results identical
+// to the C++ library built without floating-point contraction (-ffp-contract=off), as Abundance
+// builds it. Positions are flat f32 arrays with a stride in floats.
+
+pub struct Bounds {
+    center: f32[],
+    radius: f32,
+    cone_apex: f32[],
+    cone_axis: f32[],
+    cone_cutoff: f32,
+    cone_axis_s8: i64[],
+    cone_cutoff_s8: i64
+}
+
+// A vertex attribute stream for generate_vertex_remap_multi: `size` bytes per vertex, `stride`
+// bytes apart.
+pub struct Stream {
+    data: u8[],
+    size: u64,
+    stride: u64
+}
+
+fn empty_bounds() -> Bounds {
+    return Bounds { center: f32[0.0, 0.0, 0.0], radius: 0.0, cone_apex: f32[0.0, 0.0, 0.0], cone_axis: f32[0.0, 0.0, 0.0], cone_cutoff: 0.0, cone_axis_s8: i64[0, 0, 0], cone_cutoff_s8: 0 };
+}
+
+// ---- remaps ----
+
+// Position key that compares like C floats: -0 and +0 are equal; NaN equals nothing.
+fn position_key<a>(p: (&a f32[]), at: u64) -> u8[]? {
+    mut key = u8[];
+    for c in 3 {
+        v := p[at + c];
+        if v != v {
+            return None;
+        }
+        mut b = f32_bits(v);
+        if v == 0.0 {
+            b = 0;
+        }
+        for k in 4 {
+            key.push((b >> (k * 8)) & 255);
+        }
+    }
+    return Some(key);
+}
+
+// For each vertex, the first vertex with an identical position (meshopt_generatePositionRemap).
+pub fn generate_position_remap<a>(positions: (&a f32[]), vertex_count: u64, stride: u64) -> u64[] {
+    mut first = [u8[]: u64]();
+    mut out = u64[];
+    for i in vertex_count {
+        match position_key(&positions, i * stride) {
+            Some(key) => {
+                mut hit: u64 = 18446744073709551615;
+                match first.get(&key) {
+                    Some(j) => { hit = load(j); },
+                    None => { }
+                }
+                if hit == 18446744073709551615 {
+                    first.insert(key, i);
+                    out.push(i);
+                } else {
+                    out.push(hit);
+                }
+            },
+            None => { out.push(i); }
+        }
+    }
+    return out;
+}
+
+// meshopt_generateVertexRemapMulti: remap[v] numbers unique vertices (byte-identical in every
+// stream) in order of first use by `indices` (or 0..vertex_count when indices is empty and
+// index_count == vertex_count); unused vertices map to 4294967295. Returns (remap, unique count).
+pub fn generate_vertex_remap_multi<a, b>(indices: (&a u64[]), index_count: u64, vertex_count: u64, streams: (&b Stream[])) -> u64[] {
+    mut remap = u64[];
+    for i in vertex_count {
+        remap.push(4294967295);
+    }
+    mut seen = [u8[]: u64]();
+    mut next: u64 = 0;
+    for i in index_count {
+        mut index = i;
+        if indices.len() != 0 {
+            index = indices[i];
+        }
+        if remap[index] != 4294967295 {
+            continue;
+        }
+        mut key = u8[];
+        for s in streams.len() {
+            st := &streams[s];
+            base := index * st.stride;
+            for k in st.size {
+                key.push(st.data[base + k]);
+            }
+        }
+        mut hit: u64 = 18446744073709551615;
+        match seen.get(&key) {
+            Some(r) => { hit = load(r); },
+            None => { }
+        }
+        if hit == 18446744073709551615 {
+            seen.insert(key, next);
+            remap[index] = next;
+            next += 1;
+        } else {
+            remap[index] = hit;
+        }
+    }
+    remap.push(next);
+    return remap;
+}
+
+// ---- bounds ----
+
+fn axis_value(axis: u64, c: u64) -> f32 {
+    k: f32 := 0.57735026;
+    if axis < 3 {
+        if axis == c {
+            return 1.0;
+        }
+        return 0.0;
+    }
+    // XYZ, -XYZ, X-YZ, XY-Z
+    if (axis == 4) && (c == 0) {
+        return 0.0 - k;
+    }
+    if (axis == 5) && (c == 1) {
+        return 0.0 - k;
+    }
+    if (axis == 6) && (c == 2) {
+        return 0.0 - k;
+    }
+    return k;
+}
+
+// computeBoundingSphere: points p (stride ps floats), radii r (stride rs floats, rs 0 = all
+// r[0]), optionally through `indices` (empty = 0..count).
+// Which points bounding_sphere visits: indices[0..count], or 0..count when indices is empty.
+struct Selection {
+    indices: u64[],
+    count: u64
+}
+
+fn bounding_sphere<a, b, c>(p: (&a f32[]), ps: u64, r: (&b f32[]), rs: u64, axis_count: u64, sel: (&c Selection)) -> f32[] {
+    indices := &sel.indices;
+    count := sel.count;
+    flt_max: f32 := 340282346638528859811704183484516925440.0;
+    mut pmin = u64[0, 0, 0, 0, 0, 0, 0];
+    mut pmax = u64[0, 0, 0, 0, 0, 0, 0];
+    mut tmin = f32[];
+    mut tmax = f32[];
+    for a in 7 {
+        tmin.push(flt_max);
+        tmax.push(0.0 - flt_max);
+    }
+    for i in count {
+        mut v = i;
+        if indices.len() != 0 {
+            v = indices[i];
+        }
+        x := p[v * ps];
+        y := p[v * ps + 1];
+        z := p[v * ps + 2];
+        rad := r[v * rs];
+        for a in axis_count {
+            tp: f32 := axis_value(a, 0) * x + axis_value(a, 1) * y + axis_value(a, 2) * z;
+            tpmin := tp - rad;
+            tpmax := tp + rad;
+            if tpmin < tmin[a] {
+                pmin[a] = v;
+                tmin[a] = tpmin;
+            }
+            if tpmax > tmax[a] {
+                pmax[a] = v;
+                tmax[a] = tpmax;
+            }
+        }
+    }
+    mut paxis: u64 = 0;
+    mut paxisdr: f32 = 0.0;
+    for a in axis_count {
+        i1 := pmin[a] * ps;
+        i2 := pmax[a] * ps;
+        r1 := r[pmin[a] * rs];
+        r2 := r[pmax[a] * rs];
+        dx := p[i2] - p[i1];
+        dy := p[i2 + 1] - p[i1 + 1];
+        dz := p[i2 + 2] - p[i1 + 2];
+        d2: f32 := dx * dx + dy * dy + dz * dz;
+        dr: f32 := d2.sqrt() + r1 + r2;
+        if dr > paxisdr {
+            paxisdr = dr;
+            paxis = a;
+        }
+    }
+    i1 := pmin[paxis] * ps;
+    i2 := pmax[paxis] * ps;
+    r1 := r[pmin[paxis] * rs];
+    r2 := r[pmax[paxis] * rs];
+    dx := p[i2] - p[i1];
+    dy := p[i2 + 1] - p[i1 + 1];
+    dz := p[i2 + 2] - p[i1 + 2];
+    sq: f32 := dx * dx + dy * dy + dz * dz;
+    paxisd: f32 := sq.sqrt();
+    mut paxisk: f32 = 0.0;
+    if paxisd > 0.0 {
+        two: f32 := 2.0;
+        paxisk = (paxisd + r2 - r1) / (two * paxisd);
+    }
+    mut cx: f32 = p[i1] + (p[i2] - p[i1]) * paxisk;
+    mut cy: f32 = p[i1 + 1] + (p[i2 + 1] - p[i1 + 1]) * paxisk;
+    mut cz: f32 = p[i1 + 2] + (p[i2 + 2] - p[i1 + 2]) * paxisk;
+    half: f32 := 2.0;
+    mut radius: f32 = paxisdr / half;
+    for i in count {
+        mut v = i;
+        if indices.len() != 0 {
+            v = indices[i];
+        }
+        x := p[v * ps];
+        y := p[v * ps + 1];
+        z := p[v * ps + 2];
+        rad := r[v * rs];
+        ex := x - cx;
+        ey := y - cy;
+        ez := z - cz;
+        d2: f32 := ex * ex + ey * ey + ez * ez;
+        d: f32 := d2.sqrt();
+        if d + rad > radius {
+            mut k: f32 = 0.0;
+            if d > 0.0 {
+                two: f32 := 2.0;
+                k = (d + rad - radius) / (two * d);
+            }
+            cx += k * (x - cx);
+            cy += k * (y - cy);
+            cz += k * (z - cz);
+            radius = (radius + d + rad) / half;
+        }
+    }
+    return f32[cx, cy, cz, radius];
+}
+
+// meshopt_computeSphereBounds: radii empty for points (radius 0), otherwise radius of element i at
+// radii[i * radii_stride].
+pub fn compute_sphere_bounds<a, b>(positions: (&a f32[]), count: u64, stride: u64, radii: (&b f32[]), radii_stride: u64) -> Bounds {
+    mut b = empty_bounds();
+    if count == 0 {
+        return b;
+    }
+    zero := f32[0.0];
+    all := Selection { indices: u64[], count: count };
+    mut s = f32[];
+    if radii.len() == 0 {
+        s = bounding_sphere(&positions, stride, &zero, 0, 7, &all);
+    } else {
+        s = bounding_sphere(&positions, stride, &radii, radii_stride, 7, &all);
+    }
+    b.center = f32[s[0], s[1], s[2]];
+    b.radius = s[3];
+    return b;
+}
+
+fn quantize_snorm(v: f32, n: u64) -> i64 {
+    scale: f32 := f32(i64(1 << (n - 1)) - 1);
+    mut round: f32 = 0.5;
+    if (v >= 0.0) == false {
+        round = 0.0 - round;
+    }
+    mut x = v;
+    if (x >= -1.0) == false {
+        x = -1.0;
+    }
+    if (x <= 1.0) == false {
+        x = 1.0;
+    }
+    return i64(x * scale + round);
+}
+
+fn cluster_bounds<a, b, c>(indices: (&a u64[]), corners: (&b u64[]), positions: (&c f32[]), stride: u64) -> Bounds {
+    mut normals = f32[];
+    mut triangles: u64 = 0;
+    mut i: u64 = 0;
+    while i < indices.len() {
+        a := indices[i] * stride;
+        b := indices[i + 1] * stride;
+        c := indices[i + 2] * stride;
+        i += 3;
+        p10x := positions[b] - positions[a];
+        p10y := positions[b + 1] - positions[a + 1];
+        p10z := positions[b + 2] - positions[a + 2];
+        p20x := positions[c] - positions[a];
+        p20y := positions[c + 1] - positions[a + 1];
+        p20z := positions[c + 2] - positions[a + 2];
+        mut nx: f32 = p10y * p20z - p10z * p20y;
+        mut ny: f32 = p10z * p20x - p10x * p20z;
+        mut nz: f32 = p10x * p20y - p10y * p20x;
+        sq: f32 := nx * nx + ny * ny + nz * nz;
+        area: f32 := sq.sqrt();
+        if area == 0.0 {
+            continue;
+        }
+        nx = nx / area;
+        ny = ny / area;
+        nz = nz / area;
+        normals.push(nx);
+        normals.push(ny);
+        normals.push(nz);
+        w: f32 := nx * positions[a] + ny * positions[a + 1] + nz * positions[a + 2];
+        normals.push(0.0 - w);
+        triangles += 1;
+    }
+    mut bounds = empty_bounds();
+    if triangles == 0 {
+        return bounds;
+    }
+    zero := f32[0.0];
+    mut cidx = u64[];
+    for k in corners.len() {
+        cidx.push(corners[k]);
+    }
+    csel := Selection { indices: cidx, count: corners.len() };
+    psphere := bounding_sphere(&positions, stride, &zero, 0, 7, &csel);
+    tsel := Selection { indices: u64[], count: triangles };
+    nsphere := bounding_sphere(&normals, 4, &zero, 0, 3, &tsel);
+    mut ax: f32 = nsphere[0];
+    mut ay: f32 = nsphere[1];
+    mut az: f32 = nsphere[2];
+    al2: f32 := ax * ax + ay * ay + az * az;
+    axislength: f32 := al2.sqrt();
+    mut inv: f32 = 0.0;
+    if axislength != 0.0 {
+        one: f32 := 1.0;
+        inv = one / axislength;
+    }
+    ax = ax * inv;
+    ay = ay * inv;
+    az = az * inv;
+    mut mindp: f32 = 1.0;
+    for t in triangles {
+        dp: f32 := normals[t * 4] * ax + normals[t * 4 + 1] * ay + normals[t * 4 + 2] * az;
+        if dp < mindp {
+            mindp = dp;
+        }
+    }
+    bounds.center = f32[psphere[0], psphere[1], psphere[2]];
+    bounds.radius = psphere[3];
+    cutoff_min: f32 := 0.1;
+    if mindp <= cutoff_min {
+        bounds.cone_cutoff = 1.0;
+        bounds.cone_cutoff_s8 = 127;
+        return bounds;
+    }
+    mut maxt: f32 = 0.0;
+    for t in triangles {
+        dc: f32 := psphere[0] * normals[t * 4] + psphere[1] * normals[t * 4 + 1] + psphere[2] * normals[t * 4 + 2] + normals[t * 4 + 3];
+        dn: f32 := ax * normals[t * 4] + ay * normals[t * 4 + 1] + az * normals[t * 4 + 2];
+        tt: f32 := dc / dn;
+        if tt > maxt {
+            maxt = tt;
+        }
+    }
+    bounds.cone_apex = f32[psphere[0] - ax * maxt, psphere[1] - ay * maxt, psphere[2] - az * maxt];
+    bounds.cone_axis = f32[ax, ay, az];
+    one: f32 := 1.0;
+    cc: f32 := one - mindp * mindp;
+    cutoff: f32 := cc.sqrt();
+    bounds.cone_cutoff = cutoff;
+    q0 := quantize_snorm(ax, 8);
+    q1 := quantize_snorm(ay, 8);
+    q2 := quantize_snorm(az, 8);
+    bounds.cone_axis_s8 = i64[q0, q1, q2];
+    s127: f32 := 127.0;
+    e0: f32 := (f32(q0) / s127 - ax).abs();
+    e1: f32 := (f32(q1) / s127 - ay).abs();
+    e2: f32 := (f32(q2) / s127 - az).abs();
+    q := i64(s127 * (cutoff + e0 + e1 + e2) + one);
+    if 127 < q {
+        bounds.cone_cutoff_s8 = 127;
+    } else {
+        bounds.cone_cutoff_s8 = q;
+    }
+    return bounds;
+}
+
+// meshopt_computeMeshletBounds: meshlet-local vertices and triangles (byte indices into vertices).
+pub fn compute_meshlet_bounds<a, b, c>(vertices: (&a u64[]), triangles: (&b u8[]), triangle_count: u64, positions: (&c f32[]), stride: u64) -> Bounds {
+    mut indices = u64[];
+    mut corner_count: u64 = 0;
+    for i in triangle_count * 3 {
+        t := triangles[i];
+        indices.push(vertices[t]);
+        if corner_count <= t {
+            corner_count = t + 1;
+        }
+    }
+    mut corners = u64[];
+    for i in corner_count {
+        corners.push(vertices[i]);
+    }
+    return cluster_bounds(&indices, &corners, &positions, stride);
+}
