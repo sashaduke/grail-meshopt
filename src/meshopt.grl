@@ -55,16 +55,14 @@ pub fn generate_position_remap<a>(positions: (&a f32[]), vertex_count: u64, stri
     for i in vertex_count {
         match position_key(&positions, i * stride) {
             Some(key) => {
-                mut hit: u64 = 18446744073709551615;
                 match first.get(&key) {
-                    Some(j) => { hit = load(j); },
-                    None => { }
-                }
-                if hit == 18446744073709551615 {
-                    first.insert(key, i);
-                    out.push(i);
-                } else {
-                    out.push(hit);
+                    Some(j) => {
+                        out.push(*j);
+                    },
+                    None => {
+                        first.insert(key, i);
+                        out.push(i);
+                    }
                 }
             },
             None => { out.push(i); }
@@ -99,17 +97,15 @@ pub fn generate_vertex_remap_multi<a, b>(indices: (&a u64[]), index_count: u64, 
                 key.push(st.data[base + k]);
             }
         }
-        mut hit: u64 = 18446744073709551615;
         match seen.get(&key) {
-            Some(r) => { hit = load(r); },
-            None => { }
-        }
-        if hit == 18446744073709551615 {
-            seen.insert(key, next);
-            remap[index] = next;
-            next += 1;
-        } else {
-            remap[index] = hit;
+            Some(r) => {
+                remap[index] = *r;
+            },
+            None => {
+                seen.insert(key, next);
+                remap[index] = next;
+                next += 1;
+            }
         }
     }
     remap.push(next);
@@ -321,11 +317,7 @@ fn cluster_bounds<a, b, c>(indices: (&a u64[]), corners: (&b u64[]), positions: 
         return bounds;
     }
     zero := f32[0.0];
-    mut cidx = u64[];
-    for k in corners.len() {
-        cidx.push(corners[k]);
-    }
-    csel := Selection { indices: cidx, count: corners.len() };
+    csel := Selection { indices: corners.copy(), count: corners.len() };
     psphere := bounding_sphere(&positions, stride, &zero, 0, 7, &csel);
     tsel := Selection { indices: u64[], count: triangles };
     nsphere := bounding_sphere(&normals, 4, &zero, 0, 3, &tsel);
@@ -423,13 +415,6 @@ pub struct Meshlets {
     triangles: u8[]
 }
 
-fn copy_u64<a>(v: (&a u64[])) -> u64[] {
-    mut out = u64[];
-    for i in v.len() {
-        out.push(v[i]);
-    }
-    return out;
-}
 fn zeros_u8(n: u64) -> u8[] {
     mut out = u8[];
     for i in n {
@@ -876,7 +861,7 @@ pub fn build_meshlets_spatial<a, b>(indices: (&a u64[]), positions: (&b f32[]), 
     for i in fc {
         boundary.push(0);
     }
-    mut s = Bvh { boxes: boxes, axes: axes, boundary: boundary, used: used, sides: zeros_u8(fc), indices: copy_u64(&indices), face_count: fc, max_vertices: max_vertices, min_triangles: min_triangles, max_triangles: max_triangles, fill_weight: fill_weight };
+    mut s = Bvh { boxes: boxes, axes: axes, boundary: boundary, used: used, sides: zeros_u8(fc), indices: indices.copy(), face_count: fc, max_vertices: max_vertices, min_triangles: min_triangles, max_triangles: max_triangles, fill_weight: fill_weight };
     bvh_split(&mut s, 0, fc, 0);
     mut meshlet_count: u64 = 0;
     for i in fc {
@@ -885,7 +870,6 @@ pub fn build_meshlets_spatial<a, b>(indices: (&a u64[]), positions: (&b f32[]), 
     bound := build_meshlets_bound(index_count, max_vertices, min_triangles);
     mut m = Meshlet { vertex_offset: 0, triangle_offset: 0, vertex_count: 0, triangle_count: 0 };
     mut pending = meshlet_count;
-    mut used2 = exchange(&mut s.used, i64[]);
     alimits := u64[max_vertices, max_triangles];
     for i in fc {
         mut split = (i > 0) && (s.boundary[i] == 1);
@@ -894,7 +878,7 @@ pub fn build_meshlets_spatial<a, b>(indices: (&a u64[]), positions: (&b f32[]), 
         }
         f := s.axes[i];
         tri := u64[indices[f * 3], indices[f * 3 + 1], indices[f * 3 + 2]];
-        append_meshlet(&mut m, &tri, &mut result, &mut used2, &alimits, split);
+        append_meshlet(&mut m, &tri, &mut result, &mut s.used, &alimits, split);
         pending -= s.boundary[i];
     }
     if m.triangle_count != 0 {
@@ -1547,7 +1531,7 @@ fn split_points<a, b, c>(dest: (&a mut u64[]), axes: (&b mut u64[]), keys: (&c u
             p := axes[k * n + base + i];
             mut s: u64 = 0;
             match side.get(&p) {
-                Some(v) => { s = load(v); },
+                Some(v) => { s = *v; },
                 None => { }
             }
             if s == 0 {
@@ -1641,8 +1625,8 @@ pub struct Prepared {
     remap: u64[],
     wedge: u64[],
     kind: u64[],
-    loop: u64[],
-    loopback: u64[]
+    edge_loop: u64[],
+    edge_loopback: u64[]
 }
 
 fn sparse_remap_indices<a>(indices: (&a mut u64[])) -> u64[] {
@@ -1650,17 +1634,17 @@ fn sparse_remap_indices<a>(indices: (&a mut u64[])) -> u64[] {
     mut remap = u64[];
     for i in indices.len() {
         index := indices[i];
-        mut hit: u64 = NONE32;
         match seen.get(&index) {
-            Some(v) => { hit = load(v); },
-            None => { }
+            Some(v) => {
+                indices[i] = *v;
+            },
+            None => {
+                fresh := remap.len();
+                seen.insert(index, fresh);
+                remap.push(index);
+                indices[i] = fresh;
+            }
         }
-        if hit == NONE32 {
-            hit = remap.len();
-            seen.insert(index, hit);
-            remap.push(index);
-        }
-        indices[i] = hit;
     }
     return remap;
 }
@@ -1757,16 +1741,14 @@ fn position_rings<a, b>(positions: (&a f32[]), stride: u64, vertex_count: u64, s
         }
         match position_key(&positions, ri * stride) {
             Some(key) => {
-                mut hit: u64 = NONE32;
                 match first.get(&key) {
-                    Some(j) => { hit = load(j); },
-                    None => { }
-                }
-                if hit == NONE32 {
-                    first.insert(key, i);
-                    remap.push(i);
-                } else {
-                    remap.push(hit);
+                    Some(j) => {
+                        remap.push(*j);
+                    },
+                    None => {
+                        first.insert(key, i);
+                        remap.push(i);
+                    }
                 }
             },
             None => { remap.push(i); }
@@ -1933,8 +1915,8 @@ fn classify<a>(p: (&a mut Prepared), lock: (&a u8[]), options: u64) -> unit {
         }
     }
     p.kind = kind;
-    p.loop = openout;
-    p.loopback = openinc;
+    p.edge_loop = openout;
+    p.edge_loopback = openinc;
     return ();
 }
 
@@ -1952,7 +1934,7 @@ pub fn simplify_prepare<a, b>(indices: (&a u64[]), positions: (&b f32[]), vertex
     none := u64[];
     update_adjacency(&mut adj, &idx, idx.len(), n, &none);
     rings := position_rings(&positions, stride, n, &sparse);
-    mut p = Prepared { indices: idx, vertex_count: n, sparse_remap: sparse, adjacency: adj, remap: rings[0].copy(), wedge: rings[1].copy(), kind: u64[], loop: u64[], loopback: u64[] };
+    mut p = Prepared { indices: idx, vertex_count: n, sparse_remap: sparse, adjacency: adj, remap: rings[0].copy(), wedge: rings[1].copy(), kind: u64[], edge_loop: u64[], edge_loopback: u64[] };
     classify(&mut p, &lock, options);
     return p;
 }
@@ -2276,10 +2258,10 @@ pub fn fill_quadrics<a, b, c>(p: (&a Prepared), positions: (&b f32[]), stride: u
             if (b0 == false) && (b1 == false) {
                 continue;
             }
-            if ((k0 == KIND_BORDER) || (k0 == KIND_SEAM)) && (p.loop[i0] != i1) {
+            if ((k0 == KIND_BORDER) || (k0 == KIND_SEAM)) && (p.edge_loop[i0] != i1) {
                 continue;
             }
-            if ((k1 == KIND_BORDER) || (k1 == KIND_SEAM)) && (p.loopback[i1] != i0) {
+            if ((k1 == KIND_BORDER) || (k1 == KIND_SEAM)) && (p.edge_loopback[i1] != i0) {
                 continue;
             }
             if ((k0 == KIND_FRINGE) || (k1 == KIND_FRINGE)) && ((k0 == KIND_COMPLEX) || (k1 == KIND_COMPLEX)) {
@@ -2432,11 +2414,11 @@ fn quadric_error_attr<a>(st: (&a Quadrics), v: u64, t: u64, clamped: bool) -> f3
 
 fn complex_target<a>(p: (&a Prepared), v: u64, target: u64) -> u64 {
     r := p.remap[target];
-    if (p.loop[v] != NONE32) && (p.remap[p.loop[v]] == r) {
-        return p.loop[v];
+    if (p.edge_loop[v] != NONE32) && (p.remap[p.edge_loop[v]] == r) {
+        return p.edge_loop[v];
     }
-    if (p.loopback[v] != NONE32) && (p.remap[p.loopback[v]] == r) {
-        return p.loopback[v];
+    if (p.edge_loopback[v] != NONE32) && (p.remap[p.edge_loopback[v]] == r) {
+        return p.edge_loopback[v];
     }
     return target;
 }
@@ -2501,8 +2483,8 @@ pub fn simplify<a, b, c>(indices: (&a u64[]), positions: (&b f32[]), vertex_coun
     mut st = fill_quadrics(&p, &positions, stride, &attrs, astride, &weights, &lock, options);
     n := p.vertex_count;
     mut result = p.indices.copy();
-    mut loop = p.loop.copy();
-    mut loopback = p.loopback.copy();
+    mut loops = p.edge_loop.copy();
+    mut loopback = p.edge_loopback.copy();
     mut kinds = p.kind.copy();
     mut adj = Adjacency3 { offsets: u64[], next: u64[], prev: u64[] };
     clamped := (options & SIMPLIFY_ERROR_CLAMPED) != 0;
@@ -2523,7 +2505,7 @@ pub fn simplify<a, b, c>(indices: (&a u64[]), positions: (&b f32[]), vertex_coun
         clocked.push(0);
     }
     // The current state as a Prepared view for helpers that read loops.
-    mut state = Prepared { indices: u64[], vertex_count: n, sparse_remap: u64[], adjacency: Adjacency3 { offsets: u64[], next: u64[], prev: u64[] }, remap: p.remap.copy(), wedge: p.wedge.copy(), kind: kinds.copy(), loop: u64[], loopback: u64[] };
+    mut state = Prepared { indices: u64[], vertex_count: n, sparse_remap: u64[], adjacency: Adjacency3 { offsets: u64[], next: u64[], prev: u64[] }, remap: p.remap.copy(), wedge: p.wedge.copy(), kind: kinds.copy(), edge_loop: u64[], edge_loopback: u64[] };
     while result_count > target_index_count {
         update_adjacency(&mut adj, &result, result_count, n, &p.remap);
         // pickEdgeCollapses
@@ -2547,7 +2529,7 @@ pub fn simplify<a, b, c>(indices: (&a u64[]), positions: (&b f32[]), vertex_coun
                 if (has_opposite(k0, k1) != 0) && (p.remap[i1] > p.remap[i0]) {
                     continue;
                 }
-                if ((k0 == KIND_BORDER) || (k0 == KIND_SEAM)) && (k1 != KIND_MANIFOLD) && (loop[i0] != i1) {
+                if ((k0 == KIND_BORDER) || (k0 == KIND_SEAM)) && (k1 != KIND_MANIFOLD) && (loops[i0] != i1) {
                     continue;
                 }
                 if ((k1 == KIND_BORDER) || (k1 == KIND_SEAM)) && (k0 != KIND_MANIFOLD) && (loopback[i1] != i0) {
@@ -2574,8 +2556,8 @@ pub fn simplify<a, b, c>(indices: (&a u64[]), positions: (&b f32[]), vertex_coun
         if count == 0 {
             break;
         }
-        state.loop = loop.copy();
-        state.loopback = loopback.copy();
+        state.edge_loop = loops.copy();
+        state.edge_loopback = loopback.copy();
         // rankEdgeCollapses
         mut cerr = f32[];
         for ci in count {
@@ -2594,8 +2576,8 @@ pub fn simplify<a, b, c>(indices: (&a u64[]), positions: (&b f32[]), vertex_coun
                 }
                 if kinds[i0] == KIND_SEAM {
                     s0 := p.wedge[i0];
-                    mut s1 = loop[s0];
-                    if loop[i0] == i1 {
+                    mut s1 = loops[s0];
+                    if loops[i0] == i1 {
                         s1 = loopback[s0];
                     }
                     if s1 == NONE32 {
@@ -2711,8 +2693,8 @@ pub fn simplify<a, b, c>(indices: (&a u64[]), positions: (&b f32[]), vertex_coun
             } else {
                 if kind == KIND_SEAM {
                     s0 := p.wedge[i0];
-                    mut s1 = loop[s0];
-                    if loop[i0] == i1 {
+                    mut s1 = loops[s0];
+                    if loops[i0] == i1 {
                         s1 = loopback[s0];
                     }
                     if s1 == NONE32 {
@@ -2773,17 +2755,17 @@ pub fn simplify<a, b, c>(indices: (&a u64[]), positions: (&b f32[]), vertex_coun
         }
         // remapEdgeLoops (in place, in order)
         for i in n {
-            if loop[i] != NONE32 {
-                l := loop[i];
+            if loops[i] != NONE32 {
+                l := loops[i];
                 r := cremap[l];
                 if i == r {
-                    if loop[l] != NONE32 {
-                        loop[i] = cremap[loop[l]];
+                    if loops[l] != NONE32 {
+                        loops[i] = cremap[loops[l]];
                     } else {
-                        loop[i] = NONE32;
+                        loops[i] = NONE32;
                     }
                 } else {
-                    loop[i] = r;
+                    loops[i] = r;
                 }
             }
         }

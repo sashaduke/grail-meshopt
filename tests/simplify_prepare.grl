@@ -118,8 +118,8 @@ fn main() -> u64 {
         ok = ok && check_run("remap", &p.remap, &f, 3 + n, n);
         ok = ok && check_run("wedge", &p.wedge, &f, 3 + n * 2, n);
         ok = ok && check_run("kind", &p.kind, &f, 3 + n * 3, n);
-        ok = ok && check_run("loop", &p.loop, &f, 3 + n * 4, n);
-        ok = ok && check_run("loopback", &p.loopback, &f, 3 + n * 5, n);
+        ok = ok && check_run("loop", &p.edge_loop, &f, 3 + n * 4, n);
+        ok = ok && check_run("loopback", &p.edge_loopback, &f, 3 + n * 5, n);
         if ok == false {
             println("FAIL prep options={} (check {})", options, checks);
             failures += 1;
